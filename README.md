@@ -1,2 +1,7 @@
-# ZKP2P
-This is the official organization for ZKP2P, created and maintained by [richardzliang](https://twitter.com/richardzliang), [0xSachinK](https://twitter.com/0xSachinK), and [Bmwball56](https://twitter.com/Bmwball56). We are focused on ZKP2P v2 which is a productionized version of a previous hackathon [submission](https://github.com/zkp2p/zk-p2p-v1) that we now refer to v1 and are supported by EF PSE through grants, development collaboration, and audits.
+# Peer
+
+This repo holds the GitHub organization profile for Peer, the non-custodial peer-to-peer fiat-to-crypto marketplace built on the ZKP2P protocol.
+
+The org landing page content lives in [profile/README.md](profile/README.md).
+
+Learn more at [peer.xyz](https://peer.xyz) and [docs.peer.xyz](https://docs.peer.xyz).
