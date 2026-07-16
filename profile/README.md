@@ -23,7 +23,6 @@ The result: direct fiat-to-crypto trades with real payment verification instead 
 | [peer-cash](https://github.com/zkp2p/peer-cash) | Peer Cash SDK: cash out Base USDC to fiat, built agent-first |
 | [peer-examples](https://github.com/zkp2p/peer-examples) | Open-source integration examples and templates |
 | [zkp2p-skills](https://github.com/zkp2p/zkp2p-skills) | Agent Skills for AI agents to use the protocol on Base |
-| [zkp2p-registry](https://github.com/zkp2p/zkp2p-registry) | Payment platform configurations and metadata |
 | [zkp2p-v1-monorepo](https://github.com/zkp2p/zkp2p-v1-monorepo) | The original ZKP2P V1, preserved for history |
 
 Building an onramp, offramp, or cashout flow into your product? Start with the [developer docs](https://docs.peer.xyz/developer/sdk) or come talk to us in [Telegram](https://t.me/+XDj9FNnW-xs5ODNl).
