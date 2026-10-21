@@ -4,7 +4,7 @@
 
 Peer is built on the ZKP2P protocol, which started as an Ethereum Foundation PSE-supported research project and now settles real peer-to-peer volume on Base.
 
-**[Try Peer](https://peer.xyz)** | **[Docs](https://docs.peer.xyz)** | **[X](https://x.com/peerxyz)** | **[Telegram](https://t.me/+XDj9FNnW-xs5ODNl)** | **[Discord](https://discord.gg/h3rzP79jj3)**
+**[Try Peer](https://peer.xyz)** | **[Docs](https://docs.peer.xyz)** | **[X](https://x.com/peerxyz)** | **[Telegram](https://t.me/zk_p2p)**
 
 ## How it works
 
@@ -25,4 +25,4 @@ The result: direct fiat-to-crypto trades with real payment verification instead 
 | [zkp2p-skills](https://github.com/zkp2p/zkp2p-skills) | Agent Skills for AI agents to use the protocol on Base |
 | [zkp2p-v1-monorepo](https://github.com/zkp2p/zkp2p-v1-monorepo) | The original ZKP2P V1, preserved for history |
 
-Building an onramp, offramp, or cashout flow into your product? Start with the [developer docs](https://docs.peer.xyz/developer/sdk) or come talk to us in [Telegram](https://t.me/+XDj9FNnW-xs5ODNl).
+Building an onramp, offramp, or cashout flow into your product? Start with the [developer docs](https://docs.peer.xyz/developer/sdk) or come talk to us in [Telegram](https://t.me/zk_p2p).
