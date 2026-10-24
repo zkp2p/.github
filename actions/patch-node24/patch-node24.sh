@@ -25,7 +25,10 @@ from pathlib import Path
 pid = os.getppid()
 while pid > 1:
     proc = Path('/proc') / str(pid)
-    executable = (proc / 'exe').resolve(strict=True)
+    try:
+        executable = (proc / 'exe').resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f'Cannot inspect host Runner.Worker ancestry: {error.strerror}') from error
     if executable.name == 'Runner.Worker':
         root = executable.parent.parent
         if executable.parent.name != 'bin' or not root.is_relative_to('/home/runner'):
