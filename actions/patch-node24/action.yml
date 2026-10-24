@@ -1,0 +1,8 @@
+name: Patch hosted action Node 24
+description: Install the fixed Brotli decoder before main JavaScript steps run
+runs:
+  using: composite
+  steps:
+    - name: Patch the runner's bundled Node 24
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/patch-node24.sh"
