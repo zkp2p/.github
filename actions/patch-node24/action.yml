@@ -1,8 +1,11 @@
 name: Patch hosted action Node 24
-description: Install the fixed Brotli decoder before main JavaScript steps run
+description: Patch bundled Node 24 and Ubuntu 24.04 native Brotli before main steps
 runs:
   using: composite
   steps:
     - name: Patch the runner's bundled Node 24
       shell: bash
       run: bash "$GITHUB_ACTION_PATH/patch-node24.sh"
+    - name: Patch Ubuntu native Brotli
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/patch-native-brotli.py"
