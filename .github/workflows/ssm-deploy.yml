@@ -72,7 +72,17 @@ jobs:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          config=$(docker run --rm -v "$PWD:/w:ro" -w /w mikefarah/yq:4.44.3 \
+          if command -v yq >/dev/null 2>&1; then
+            yq_version=$(yq --version)
+            if [[ "$yq_version" != *mikefarah* && ! "$yq_version" =~ version[[:space:]]v4([.]|$) ]]; then
+              echo 'Installed yq must be mikefarah/yq v4' >&2
+              exit 1
+            fi
+            yq_command=(yq)
+          else
+            yq_command=(docker run --rm -v "$PWD:/w:ro" -w /w mikefarah/yq:4.44.3)
+          fi
+          config=$("${yq_command[@]}" \
             -o=json "./$ENVIRONMENTS_FILE" 2>/dev/null) || {
             echo 'Could not read environments-file' >&2
             exit 1
@@ -293,35 +303,47 @@ jobs:
           seen='[]'
           received=false
           while (( $(date +%s) - started < 3900 )); do
-            response=$(timeout 60s aws logs filter-log-events \
-              --log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/" \
-              --start-time "$cursor" --output json 2>/dev/null) || {
-              echo 'Could not read command logs' >&2
-              exit 1
-            }
-            events=$(jq -ce --argjson seen "$seen" \
-              '[.events[] | select(.eventId as $id | $seen | index($id) | not)]' <<< "$response")
-            if [[ $(jq 'length' <<< "$events") != 0 ]]; then
-              received=true
-              stop_token=$(openssl rand -hex 16)
-              printf '::stop-commands::%s\n' "$stop_token"
-              jq -r '.[].message' <<< "$events"
-              printf '::%s::\n' "$stop_token"
-              if deploy_exit=$(jq -er '
-                [.[].message | scan("\\{\\s*\"deployExit\"\\s*:\\s*([0-9]+)\\s*\\}") | .[0] | tonumber]
-                | if length > 0 then .[-1] else empty end
-              ' <<< "$events"); then
-                if [[ "$deploy_exit" == 0 ]]; then
-                  exit 0
-                fi
-                echo 'SSM deploy failed' >&2
-                exit 1
+            # Keep request parameters fixed while draining this poll's pages.
+            log_args=(--log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/"
+              --start-time "$cursor" --no-paginate --output json)
+            page_args=("${log_args[@]}")
+            while :; do
+              if (( $(date +%s) - started >= 3900 )); then
+                break 2
               fi
-              # Keep the boundary inclusive so later events in the same millisecond survive.
-              cursor=$(jq '[.[].timestamp] | max' <<< "$events")
-              seen=$(jq -c --argjson cursor "$cursor" --argjson seen "$seen" \
-                '$seen + [.[] | select(.timestamp == $cursor) | .eventId] | unique' <<< "$events")
-            fi
+              response=$(timeout 60s aws logs filter-log-events "${page_args[@]}" 2>/dev/null) || {
+                echo 'Could not read command logs' >&2
+                exit 1
+              }
+              events=$(jq -ce --argjson seen "$seen" \
+                '[.events[] | select(.eventId as $id | $seen | index($id) | not)]' <<< "$response")
+              if [[ $(jq 'length' <<< "$events") != 0 ]]; then
+                received=true
+                stop_token=$(openssl rand -hex 16)
+                printf '::stop-commands::%s\n' "$stop_token"
+                jq -r '.[].message' <<< "$events"
+                printf '::%s::\n' "$stop_token"
+                if deploy_exit=$(jq -er '
+                  [.[].message | scan("\\{\\s*\"deployExit\"\\s*:\\s*([0-9]+)\\s*\\}") | .[0] | tonumber]
+                  | if length > 0 then .[-1] else empty end
+                ' <<< "$events"); then
+                  if [[ "$deploy_exit" == 0 ]]; then
+                    exit 0
+                  fi
+                  echo 'SSM deploy failed' >&2
+                  exit 1
+                fi
+                # Keep the boundary inclusive so later events in the same millisecond survive.
+                cursor=$(jq '[.[].timestamp] | max' <<< "$events")
+                seen=$(jq -c --argjson cursor "$cursor" --argjson seen "$seen" \
+                  '$seen + [.[] | select(.timestamp == $cursor) | .eventId] | unique' <<< "$events")
+              fi
+              next_token=$(jq -r '.nextToken // empty' <<< "$response")
+              if [[ -z "$next_token" ]]; then
+                break
+              fi
+              page_args=("${log_args[@]}" --next-token "$next_token")
+            done
             if [[ "$received" == false ]] && (( $(date +%s) - started >= 600 )); then
               echo 'Command was not delivered (agent offline?)' >&2
               exit 1
@@ -357,8 +379,8 @@ jobs:
             '{text: $text}' | curl --silent --fail --connect-timeout 10 --max-time 30 \
               -H 'Content-Type: application/json' --data-binary @- "$SLACK_WEBHOOK_URL" \
               >/dev/null 2>&1 || {
-              echo 'Could not send deploy notification' >&2
-              exit 1
+              echo '::warning::Could not send deploy notification'
+              exit 0
             }
       - name: Require successful deploy
         if: always()

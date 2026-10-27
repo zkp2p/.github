@@ -112,7 +112,8 @@ jobs:
 
 Omit the `secrets` mapping when notifications are not needed. The optional webhook
 receives one line containing repository, environment, mode, short commit, result
-and run URL.
+and run URL. Notification failures emit a warning and do not affect the result;
+the final success gate depends only on log polling and deployment-status recording.
 
 | Input | Contract |
 | --- | --- |
@@ -124,7 +125,11 @@ and run URL.
 | `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
-| `runner` | Default `ubuntu-latest`; a Linux runner with Bash, Docker, jq, gh, AWS CLI, OpenSSL and GNU timeout. |
+| `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
+
+Environment resolution uses the runner's preinstalled mikefarah/yq, verified by
+`yq --version`, and falls back to `mikefarah/yq:4.44.3` in Docker only when yq is
+missing. An incompatible installed yq fails resolution.
 
 Image mode requires all four artifact inputs to be real values. Both config modes
 force **all four**, including `source-sha`, to `none` before sending the command,
@@ -145,7 +150,9 @@ group. The workflow never queries SSM command status. Its document must accept
 `AllowKeyRemoval`, write value-safe logs under the command ID stream prefix, and
 emit `{"deployExit": N}` when finished. Zero means success; a nonzero marker fails
 the deployment. Logs are polled every 15 seconds with a timestamp cursor and
-event ID deduplication. No events after 10 minutes or no exit marker after
+event ID deduplication. Each poll follows `nextToken`, including through empty
+pages, with a fixed start time before advancing to the next poll.
+No events after 10 minutes or no exit marker after
 65 minutes fails the workflow. A workflow timeout does not cancel the host
 command; the document must enforce its own execution timeout.
 
@@ -153,13 +160,18 @@ Deployment status is recorded as `in_progress`, then `success` or `failure`, wit
 a link to the workflow run. Hosted jobs use the runtime patch described above
 before JavaScript actions; self-hosted runner maintenance belongs to the caller.
 
-Run the local checks from the repository root (Docker must be running):
+Run the local checks from the repository root (Docker must be running; the shell
+step harness also requires Python 3, jq and OpenSSL):
 
 ```bash
 bash scripts/test-ci-gate.sh # 4 passed
+python3 scripts/test-ssm-deploy.py
 actionlint .github/workflows/ssm-deploy.yml
 ```
 
 The test extracts the workflow's `decide.env.DECISION_JQ` with
 `mikefarah/yq:4.44.3` and checks success, failure with an unfinished run, failure
-only, and empty results. These checks do not exercise a live deployment.
+only, and empty results. The shell step harness checks yq selection, log
+pagination and deduplication, polling failures/timeouts, Slack failures, and the
+final success gate with isolated fake external commands. These checks do not
+exercise a live deployment or call AWS/GitHub APIs.
