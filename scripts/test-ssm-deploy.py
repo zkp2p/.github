@@ -107,17 +107,72 @@ class DeployTests(unittest.TestCase):
     def test_slack_unconfigured(self):
         self.assert_exit(self.run_step("deploy", "Notify Slack if configured", SLACK_WEBHOOK_URL=""), 0)
 
-    def test_final_gate_uses_poll_and_status_only(self):
+    def test_config_plan_skips_deployment_records(self):
+        self.assertEqual(step("deploy", "Create GitHub deployment").get("if"),
+                         "inputs.mode != 'config-plan'")
+        self.assertEqual(step("deploy", "Record deployment result")["if"],
+                         "always() && steps.deployment.outputs.id != ''")
+
+    def deployment_api(self):
+        self.tool("gh", '''
+[[ "$1 $2 $3" == 'api --method POST' ]]
+endpoint=$4
+shift 4
+case "$endpoint" in
+  "repos/$REPO/deployments")
+    [[ "$*" == '--input -' ]]
+    jq . > "$STATE/deployment.json"
+    echo '{"id": 42}'
+    ;;
+  "repos/$REPO/deployments/42/statuses")
+    printf '%s\\n' "$@" > "$STATE/status-args"
+    ;;
+  *) exit 90 ;;
+esac
+''')
+
+    def test_image_and_config_deployment_metadata(self):
+        self.deployment_api()
+        for mode, task in (("image", "deploy"), ("config", "deploy:config")):
+            with self.subTest(mode=mode):
+                result = self.run_step("deploy", "Create GitHub deployment", MODE=mode)
+                self.assert_exit(result, 0)
+                self.assertEqual(json.loads((self.root / "deployment.json").read_text()), {
+                    "ref": self.env["SHA"], "environment": "staging", "auto_merge": False,
+                    "required_contexts": [], "task": task,
+                    "description": f"{mode} deploy of {self.env['SHA'][:7]}",
+                })
+                self.assertEqual((self.root / "outputs").read_text().splitlines()[-1], "id=42")
+                self.assertEqual((self.root / "status-args").read_text().splitlines(),
+                                 ["-f", "state=in_progress", "-f", f"log_url={self.env['RUN_URL']}"])
+
+    def test_deployment_result_description(self):
+        self.deployment_api()
+        for mode in ("image", "config"):
+            for result, description in (("success", "succeeded"), ("failure", "failed")):
+                with self.subTest(mode=mode, result=result):
+                    self.assert_exit(self.run_step("deploy", "Record deployment result",
+                                                   MODE=mode, RESULT=result, DEPLOYMENT_ID="42"), 0)
+                    args = (self.root / "status-args").read_text().splitlines()
+                    self.assertEqual(args[::2], ["-f", "-f", "-f"])
+                    self.assertCountEqual(args[1::2], [f"state={result}",
+                                                      f"log_url={self.env['RUN_URL']}",
+                                                      f"description={mode} deploy {description}"])
+
+    def test_final_gate_and_slack_result_by_mode(self):
         gate = step("deploy", "Require successful deploy")
         self.assertEqual(gate["if"], "always()")
         self.assertEqual(gate["env"]["RESULT"],
-                         "${{ steps.poll.outcome == 'success' && steps.status.outcome == 'success' && 'success' || 'failure' }}")
-        for poll in ("success", "failure", "skipped", "cancelled"):
-            for status in ("success", "failure", "skipped", "cancelled"):
-                success = poll == status == "success"
-                with self.subTest(poll=poll, status=status):
-                    self.assert_exit(self.run_step("deploy", "Require successful deploy",
-                                                   RESULT="success" if success else "failure"), 0 if success else 1)
+                         "${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}")
+        self.assertEqual(step("deploy", "Notify Slack if configured")["env"]["RESULT"],
+                         gate["env"]["RESULT"])
+        for mode in ("image", "config", "config-plan"):
+            for poll in ("success", "failure", "skipped", "cancelled"):
+                for status in ("success", "failure", "skipped", "cancelled"):
+                    success = poll == "success" and (mode == "config-plan" or status == "success")
+                    with self.subTest(mode=mode, poll=poll, status=status):
+                        self.assert_exit(self.run_step("deploy", "Require successful deploy", MODE=mode,
+                                                       RESULT="success" if success else "failure"), 0 if success else 1)
 
     def pages(self, responses):
         for index, response in enumerate(responses):

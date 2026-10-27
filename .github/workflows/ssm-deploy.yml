@@ -250,10 +250,17 @@ jobs:
           action-timeout-s: 120
       - name: Create GitHub deployment
         id: deployment
+        if: inputs.mode != 'config-plan'
         run: |
           set -euo pipefail
+          task=deploy
+          if [[ "$MODE" == config ]]; then
+            task=deploy:config
+          fi
           deployment=$(jq -n --arg ref "$SHA" --arg environment "$DEPLOY_ENVIRONMENT" \
-            '{ref: $ref, environment: $environment, auto_merge: false, required_contexts: []}' \
+            --arg task "$task" --arg description "$MODE deploy of ${SHA:0:7}" \
+            '{ref: $ref, environment: $environment, task: $task, description: $description,
+              auto_merge: false, required_contexts: []}' \
             | timeout 60s gh api --method POST "repos/$REPO/deployments" --input - 2>/dev/null) || {
             echo 'Could not create GitHub deployment' >&2
             exit 1
@@ -367,8 +374,12 @@ jobs:
           RESULT: ${{ steps.poll.outcome == 'success' && 'success' || 'failure' }}
         run: |
           set -euo pipefail
+          description="$MODE deploy failed"
+          if [[ "$RESULT" == success ]]; then
+            description="$MODE deploy succeeded"
+          fi
           timeout 60s gh api --method POST "repos/$REPO/deployments/$DEPLOYMENT_ID/statuses" \
-            -f state="$RESULT" -f log_url="$RUN_URL" >/dev/null 2>&1 || {
+            -f state="$RESULT" -f log_url="$RUN_URL" -f description="$description" >/dev/null 2>&1 || {
             echo 'Could not record deployment result' >&2
             exit 1
           }
@@ -376,7 +387,7 @@ jobs:
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
-          RESULT: ${{ steps.poll.outcome == 'success' && steps.status.outcome == 'success' && 'success' || 'failure' }}
+          RESULT: ${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}
         run: |
           set -euo pipefail
           if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
@@ -392,5 +403,5 @@ jobs:
       - name: Require successful deploy
         if: always()
         env:
-          RESULT: ${{ steps.poll.outcome == 'success' && steps.status.outcome == 'success' && 'success' || 'failure' }}
+          RESULT: ${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}
         run: test "$RESULT" = success
