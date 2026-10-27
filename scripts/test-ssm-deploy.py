@@ -141,45 +141,111 @@ done
 printf '%s:%s\\n' "$start" "$token" >> "$STATE/requests"
 index=$(jq -r '. // 0' "$STATE/index" 2>/dev/null || echo 0)
 printf '%s\\n' "$((index + 1))" > "$STATE/index"
-jq . "$STATE/page-$index.json"
+jq --argjson start "$start" '.events |= map(select(.timestamp >= $start))' "$STATE/page-$index.json"
 ''')
 
-    @staticmethod
-    def event(event_id, timestamp, message):
-        return {"eventId": event_id, "timestamp": timestamp, "message": message,
-                "ingestionTime": timestamp, "logStreamName": "test-command/stdout"}
+    def record_sleeps(self):
+        self.tool("sleep", '''
+printf '%s:%s\\n' "$1" "$(jq -r . "$STATE/index")" >> "$STATE/sleeps"
+''')
 
-    def test_paginated_logs_drain_before_sleep(self):
-        first = self.event("first", 1000001, "first page")
+    def assert_log_messages(self, result, expected):
+        messages = []
+        stop_token = None
+        for line in result.stdout.splitlines():
+            if stop_token is None:
+                self.assertRegex(line, r"^::stop-commands::[0-9a-f]{32}$")
+                stop_token = line.removeprefix("::stop-commands::")
+            elif line == f"::{stop_token}::":
+                stop_token = None
+            else:
+                messages.append(line)
+        self.assertIsNone(stop_token, "Log output did not restore workflow commands")
+        self.assertEqual(messages, expected)
+
+    @staticmethod
+    def event(event_id, timestamp, message, stream="stdout"):
+        return {"eventId": event_id, "timestamp": timestamp, "message": message,
+                "ingestionTime": timestamp, "logStreamName": f"test-command/{stream}"}
+
+    def test_paginated_logs_sorted_and_deduplicated_before_sleep(self):
+        early = self.event("early", 1000001, "earliest timestamp")
+        first = self.event("first", 1000002, "first page")
+        tie = self.event("aaa", 1000002, "same timestamp, earlier ID")
+        marker = self.event("exit", 1000003, '{"deployExit": 0}')
         self.pages([
             {"events": [first], "nextToken": "page-two"},
             {"events": [], "nextToken": "page-three"},
-            {"events": [first, self.event("last", 1000001, '{"deployExit": 0}')]},
+            {"events": [marker, first, tie, early, early]},
+            {"events": [early, first, tie, marker]},
         ])
+        self.record_sleeps()
         result = self.run_step("deploy", "Follow command logs")
         self.assert_exit(result, 0)
-        self.assertEqual(result.stdout.count("first page"), 1)
-        self.assertIn('{"deployExit": 0}', result.stdout)
+        self.assert_log_messages(result, [early["message"], tie["message"], first["message"], marker["message"]])
         self.assertEqual((self.root / "requests").read_text().splitlines(),
-                         ["1000000:", "1000000:page-two", "1000000:page-three"])
+                         ["1000000:", "1000000:page-two", "1000000:page-three", "1000000:"])
+        self.assertEqual((self.root / "sleeps").read_text().splitlines(), ["10:3"])
 
-    def test_poll_cursor_stays_inclusive(self):
-        first = self.event("first", 1000001, "first poll")
+    def test_late_event_with_earlier_timestamp_printed_once(self):
+        first = self.event("first", 1000020, "new workers ready")
+        late = self.event("late", 1000010, '{"phase": "old_workers_drained"}', stream="stderr")
+        late["ingestionTime"] = 1000030
+        marker = self.event("exit", 1000040, '{"deployExit": 0}')
         self.pages([
             {"events": [first]},
-            {"events": [first, self.event("last", 1000001, '{"deployExit": 0}')]},
+            {"events": [late, first]},
+            {"events": [late, first, marker]},
+            {"events": [late, first, marker]},
         ])
-        self.tool("sleep", 'exit 0')
+        self.record_sleeps()
         result = self.run_step("deploy", "Follow command logs")
         self.assert_exit(result, 0)
-        self.assertEqual(result.stdout.count("first poll"), 1)
-        self.assertEqual((self.root / "requests").read_text().splitlines(), ["1000000:", "1000001:"])
+        self.assert_log_messages(result, [first["message"], late["message"], marker["message"]])
+        self.assertEqual((self.root / "requests").read_text().splitlines(), ["1000000:"] * 4)
+        self.assertEqual((self.root / "sleeps").read_text().splitlines(), ["15:1", "15:2", "10:3"])
+
+    def test_final_drain_reads_all_pages_and_prints_unseen_events(self):
+        marker = self.event("exit", 1000030, '{"deployExit": 0}')
+        tail = self.event("tail", 1000040, "another page after the marker")
+        late = self.event("late", 1000010, '{"phase": "old_workers_drained"}')
+        stderr = self.event("stderr", 1000020, "::error::late stderr", stream="stderr")
+        self.pages([
+            {"events": [marker], "nextToken": "after-marker"},
+            {"events": [tail]},
+            {"events": [marker, tail, stderr], "nextToken": "drain-two"},
+            {"events": [], "nextToken": "drain-three"},
+            {"events": [late, stderr]},
+        ])
+        self.record_sleeps()
+        result = self.run_step("deploy", "Follow command logs")
+        self.assert_exit(result, 0)
+        self.assert_log_messages(result, [marker["message"], tail["message"], late["message"], stderr["message"]])
+        self.assertEqual((self.root / "requests").read_text().splitlines(),
+                         ["1000000:", "1000000:after-marker", "1000000:",
+                          "1000000:drain-two", "1000000:drain-three"])
+        self.assertEqual((self.root / "sleeps").read_text().splitlines(), ["10:2"])
 
     def test_nonzero_exit_marker_fails(self):
-        self.pages([{"events": [self.event("exit", 1000001, '{"deployExit": 7}')]}])
+        marker = self.event("exit", 1000020, '{"deployExit": 7}')
+        late = self.event("late", 1000010, "late failure details", stream="stderr")
+        self.pages([{"events": [marker]}, {"events": [late, marker]}])
+        self.record_sleeps()
+        result = self.run_step("deploy", "Follow command logs")
+        self.assert_exit(result, 7)
+        self.assertIn("SSM deploy failed", result.stderr)
+        self.assert_log_messages(result, [marker["message"], late["message"]])
+        self.assertEqual((self.root / "requests").read_text().splitlines(), ["1000000:"] * 2)
+        self.assertEqual((self.root / "sleeps").read_text().splitlines(), ["10:1"])
+
+    def test_final_drain_read_error_fails(self):
+        self.pages([{"events": [self.event("exit", 1000001, '{"deployExit": 0}')]}])
+        self.record_sleeps()
         result = self.run_step("deploy", "Follow command logs")
         self.assert_exit(result, 1)
-        self.assertIn("SSM deploy failed", result.stderr)
+        self.assertIn("Could not read command logs", result.stderr)
+        self.assertEqual((self.root / "requests").read_text().splitlines(), ["1000000:"] * 2)
+        self.assertEqual((self.root / "sleeps").read_text().splitlines(), ["10:1"])
 
     def test_paginated_read_error_fails(self):
         self.pages([{"events": [], "nextToken": "missing-page"}])
