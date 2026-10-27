@@ -299,13 +299,15 @@ jobs:
         run: |
           set -euo pipefail
           started=$((STARTED_AT / 1000))
-          cursor=$STARTED_AT
           seen='[]'
           received=false
+          final_drain=false
+          deploy_exit=''
+          # Late ingestion can put new events before any previously seen timestamp.
+          log_args=(--log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/"
+            --start-time "$STARTED_AT" --no-paginate --output json)
           while (( $(date +%s) - started < 3900 )); do
-            # Keep request parameters fixed while draining this poll's pages.
-            log_args=(--log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/"
-              --start-time "$cursor" --no-paginate --output json)
+            events='[]'
             page_args=("${log_args[@]}")
             while :; do
               if (( $(date +%s) - started >= 3900 )); then
@@ -315,35 +317,40 @@ jobs:
                 echo 'Could not read command logs' >&2
                 exit 1
               }
-              events=$(jq -ce --argjson seen "$seen" \
-                '[.events[] | select(.eventId as $id | $seen | index($id) | not)]' <<< "$response")
-              if [[ $(jq 'length' <<< "$events") != 0 ]]; then
-                received=true
-                stop_token=$(openssl rand -hex 16)
-                printf '::stop-commands::%s\n' "$stop_token"
-                jq -r '.[].message' <<< "$events"
-                printf '::%s::\n' "$stop_token"
-                if deploy_exit=$(jq -er '
-                  [.[].message | scan("\\{\\s*\"deployExit\"\\s*:\\s*([0-9]+)\\s*\\}") | .[0] | tonumber]
-                  | if length > 0 then .[-1] else empty end
-                ' <<< "$events"); then
-                  if [[ "$deploy_exit" == 0 ]]; then
-                    exit 0
-                  fi
-                  echo 'SSM deploy failed' >&2
-                  exit 1
-                fi
-                # Keep the boundary inclusive so later events in the same millisecond survive.
-                cursor=$(jq '[.[].timestamp] | max' <<< "$events")
-                seen=$(jq -c --argjson cursor "$cursor" --argjson seen "$seen" \
-                  '$seen + [.[] | select(.timestamp == $cursor) | .eventId] | unique' <<< "$events")
-              fi
+              events=$(jq -ce --argjson events "$events" '$events + .events' <<< "$response")
               next_token=$(jq -r '.nextToken // empty' <<< "$response")
               if [[ -z "$next_token" ]]; then
                 break
               fi
               page_args=("${log_args[@]}" --next-token "$next_token")
             done
+            events=$(jq -ce --argjson seen "$seen" '
+              [.[] | select(.eventId as $id | $seen | index($id) | not)]
+              | unique_by(.eventId) | sort_by(.timestamp, .eventId)
+            ' <<< "$events")
+            if [[ $(jq 'length' <<< "$events") != 0 ]]; then
+              received=true
+              stop_token=$(openssl rand -hex 16)
+              printf '::stop-commands::%s\n' "$stop_token"
+              jq -r '.[].message' <<< "$events"
+              printf '::%s::\n' "$stop_token"
+              seen=$(jq -c --argjson seen "$seen" '$seen + [.[].eventId] | unique' <<< "$events")
+            fi
+            if [[ "$final_drain" == true ]]; then
+              if [[ "$deploy_exit" != 0 ]]; then
+                echo 'SSM deploy failed' >&2
+              fi
+              exit "$deploy_exit"
+            fi
+            if deploy_exit=$(jq -er '
+              [.[].message | scan("\\{\\s*\"deployExit\"\\s*:\\s*([0-9]+)\\s*\\}") | .[0] | tonumber]
+              | if length > 0 then .[-1] else empty end
+            ' <<< "$events"); then
+              # Give both stdout and stderr time to ingest, then read every page once more.
+              final_drain=true
+              sleep 10
+              continue
+            fi
             if [[ "$received" == false ]] && (( $(date +%s) - started >= 600 )); then
               echo 'Command was not delivered (agent offline?)' >&2
               exit 1

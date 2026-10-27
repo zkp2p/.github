@@ -149,9 +149,12 @@ group. The workflow never queries SSM command status. Its document must accept
 `Mode`, `ArtifactKey`, `ManifestSha256`, `ImageId`, `SourceSha` and
 `AllowKeyRemoval`, write value-safe logs under the command ID stream prefix, and
 emit `{"deployExit": N}` when finished. Zero means success; a nonzero marker fails
-the deployment. Logs are polled every 15 seconds with a timestamp cursor and
-event ID deduplication. Each poll follows `nextToken`, including through empty
-pages, with a fixed start time before advancing to the next poll.
+the deployment. Logs are polled every 15 seconds from the fixed command start
+time, following every `nextToken`, including through empty pages. Previously
+printed event IDs are deduplicated, and each poll's new events are printed in
+timestamp and event ID order so late ingestion cannot skip earlier events.
+After an exit marker, the poller waits 10 seconds and performs one final full
+read before exiting with the marker's status.
 No events after 10 minutes or no exit marker after
 65 minutes fails the workflow. A workflow timeout does not cancel the host
 command; the document must enforce its own execution timeout.
