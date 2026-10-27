@@ -1,0 +1,367 @@
+name: SSM deploy
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: true
+      artifact-key:
+        type: string
+        required: true
+      manifest-sha256:
+        type: string
+        required: true
+      image-id:
+        type: string
+        required: true
+      source-sha:
+        type: string
+        required: true
+      allow-key-removal:
+        type: boolean
+        default: false
+      environments-file:
+        type: string
+        default: deploy/environments.yml
+      ci-workflow:
+        type: string
+        default: ci.yml
+      runner:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      slack-webhook-url:
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      instance-id: ${{ steps.resolve.outputs.instance-id }}
+      role-arn: ${{ steps.resolve.outputs.role-arn }}
+      region: ${{ steps.resolve.outputs.region }}
+      document: ${{ steps.resolve.outputs.document }}
+      log-group: ${{ steps.resolve.outputs.log-group }}
+      ci: ${{ steps.resolve.outputs.ci }}
+    steps:
+      - name: Patch hosted action runtime
+        if: runner.environment == 'github-hosted'
+        uses: zkp2p/.github/actions/patch-node24@96cd20d1545013b0e7e89b56ce80ab2c4a42df9d # reviewed runtime patch
+      - name: Check out caller environment map
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: ${{ inputs.environments-file }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Resolve environment
+        id: resolve
+        env:
+          ENVIRONMENTS_FILE: ${{ inputs.environments-file }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          config=$(docker run --rm -v "$PWD:/w:ro" -w /w mikefarah/yq:4.44.3 \
+            -o=json "./$ENVIRONMENTS_FILE" 2>/dev/null) || {
+            echo 'Could not read environments-file' >&2
+            exit 1
+          }
+          matches=$(jq -ce --arg ref "$REF" \
+            '[.environments | to_entries[] | select(.value.branch == $ref)]' <<< "$config")
+          count=$(jq 'length' <<< "$matches")
+          if [[ "$count" == 0 ]]; then
+            printf 'No deploy environment for %s\n' "$REF" >&2
+            exit 1
+          fi
+          if [[ "$count" != 1 ]]; then
+            echo 'Multiple deploy environments match the branch' >&2
+            exit 1
+          fi
+          outputs=$(jq -cen --argjson config "$config" --argjson match "$matches" '
+            {
+              environment: $match[0].key,
+              "instance-id": $match[0].value.instanceId,
+              "role-arn": $match[0].value.roleArn,
+              region: $config.region,
+              document: $config.ssmDocument,
+              "log-group": $config.logGroup,
+              ci: $match[0].value.ci
+            }
+            | if all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not))
+                and (.ci == "required" or .ci == "skip")
+              then . else error("Invalid environment configuration") end
+          ')
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$outputs" >> "$GITHUB_OUTPUT"
+
+  ci-gate:
+    needs: resolve
+    if: needs.resolve.outputs.ci == 'required' && inputs.mode == 'image'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 50
+    permissions:
+      actions: write
+    steps:
+      - name: Wait for CI on the image commit
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ inputs.source-sha }}
+          REF: ${{ github.ref_name }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          DECISION_JQ: |
+            .workflow_runs
+            | if type != "array" then error("Missing workflow_runs")
+              elif any(.[]; .status == "completed" and .conclusion == "success") then "pass"
+              elif any(.[]; .status != "completed") then "wait"
+              elif length > 0 then "fail"
+              else "dispatch"
+              end
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          dispatched=false
+          while (( $(date +%s) - started < 2700 )); do
+            runs=$(timeout 60s gh api \
+              "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" \
+              2>/dev/null) || {
+              echo 'Could not read CI runs' >&2
+              exit 1
+            }
+            decision=$(jq -er "$DECISION_JQ" <<< "$runs")
+            case "$decision" in
+              pass) exit 0 ;;
+              fail) echo 'CI failed for the image commit' >&2; exit 1 ;;
+              wait) ;;
+              dispatch)
+                if [[ "$dispatched" == false ]]; then
+                  timeout 60s gh workflow run "$CI_WORKFLOW" --ref "$REF" --repo "$REPO" \
+                    >/dev/null 2>&1 || {
+                    echo 'Could not dispatch CI' >&2
+                    exit 1
+                  }
+                  dispatched=true
+                fi
+                ;;
+              *) echo 'Invalid CI decision' >&2; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo 'CI did not pass within 45 minutes' >&2
+          exit 1
+
+  deploy:
+    needs: [resolve, ci-gate]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 80
+    permissions:
+      id-token: write
+      deployments: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      MODE: ${{ inputs.mode }}
+      DEPLOY_ENVIRONMENT: ${{ needs.resolve.outputs.environment }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      AWS_PAGER: ''
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: '3'
+    steps:
+      - name: Patch hosted action runtime
+        if: runner.environment == 'github-hosted'
+        uses: zkp2p/.github/actions/patch-node24@96cd20d1545013b0e7e89b56ce80ab2c4a42df9d # reviewed runtime patch
+      - name: Normalize deploy parameters
+        id: normalize
+        env:
+          ARTIFACT_KEY: ${{ inputs.artifact-key }}
+          MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
+          IMAGE_ID: ${{ inputs.image-id }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          ALLOW_KEY_REMOVAL: ${{ inputs.allow-key-removal }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            image)
+              for key in ARTIFACT_KEY MANIFEST_SHA256 IMAGE_ID SOURCE_SHA; do
+                if [[ -z "${!key}" || "${!key}" == none ]]; then
+                  printf 'Image deploy requires %s\n' "$key" >&2
+                  exit 1
+                fi
+              done
+              if [[ ! "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ||
+                    ! "$IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ||
+                    ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+                echo 'Invalid MANIFEST_SHA256, IMAGE_ID or SOURCE_SHA' >&2
+                exit 1
+              fi
+              ;;
+            config|config-plan)
+              ARTIFACT_KEY=none
+              MANIFEST_SHA256=none
+              IMAGE_ID=none
+              SOURCE_SHA=none
+              ;;
+            *) echo 'Invalid mode' >&2; exit 1 ;;
+          esac
+          case "$ALLOW_KEY_REMOVAL" in
+            true|false) ;;
+            *) echo 'Invalid ALLOW_KEY_REMOVAL' >&2; exit 1 ;;
+          esac
+          umask 077
+          jq -n --arg mode "$MODE" --arg artifact "$ARTIFACT_KEY" \
+            --arg manifest "$MANIFEST_SHA256" --arg image "$IMAGE_ID" \
+            --arg source "$SOURCE_SHA" --arg allow "$ALLOW_KEY_REMOVAL" \
+            '{Mode: [$mode], ArtifactKey: [$artifact], ManifestSha256: [$manifest],
+              ImageId: [$image], SourceSha: [$source], AllowKeyRemoval: [$allow]}' \
+            > "$RUNNER_TEMP/ssm-parameters.json"
+      - name: Assume deploy role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ needs.resolve.outputs.role-arn }}
+          aws-region: ${{ needs.resolve.outputs.region }}
+          role-session-name: deploy-${{ github.event.repository.name }}-${{ github.run_id }}
+          role-duration-seconds: 7200
+          mask-aws-account-id: true
+          unset-current-credentials: true
+          retry-max-attempts: 3
+          action-timeout-s: 120
+      - name: Create GitHub deployment
+        id: deployment
+        run: |
+          set -euo pipefail
+          deployment=$(jq -n --arg ref "$SHA" --arg environment "$DEPLOY_ENVIRONMENT" \
+            '{ref: $ref, environment: $environment, auto_merge: false, required_contexts: []}' \
+            | timeout 60s gh api --method POST "repos/$REPO/deployments" --input - 2>/dev/null) || {
+            echo 'Could not create GitHub deployment' >&2
+            exit 1
+          }
+          deployment_id=$(jq -er '.id | select(type == "number")' <<< "$deployment")
+          printf 'id=%s\n' "$deployment_id" >> "$GITHUB_OUTPUT"
+          timeout 60s gh api --method POST "repos/$REPO/deployments/$deployment_id/statuses" \
+            -f state=in_progress -f log_url="$RUN_URL" >/dev/null 2>&1 || {
+            echo 'Could not mark deployment in progress' >&2
+            exit 1
+          }
+      - name: Send SSM command
+        id: command
+        env:
+          DOCUMENT: ${{ needs.resolve.outputs.document }}
+          INSTANCE_ID: ${{ needs.resolve.outputs.instance-id }}
+          LOG_GROUP: ${{ needs.resolve.outputs.log-group }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          started_at=$(( $(date +%s) * 1000 ))
+          command_id=$(timeout 60s aws ssm send-command \
+            --document-name "$DOCUMENT" --instance-ids "$INSTANCE_ID" \
+            --timeout-seconds 600 --parameters "file://$RUNNER_TEMP/ssm-parameters.json" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=$LOG_GROUP" \
+            --comment "$REPO@${SHA:0:7} $MODE run $RUN_ID" \
+            --query 'Command.CommandId' --output text 2>/dev/null) || {
+            echo 'Could not send SSM command' >&2
+            exit 1
+          }
+          if [[ ! "$command_id" =~ ^[a-f0-9-]{36}$ ]]; then
+            echo 'Invalid SSM command ID' >&2
+            exit 1
+          fi
+          printf 'command-id=%s\nstarted-at=%s\n' "$command_id" "$started_at" >> "$GITHUB_OUTPUT"
+      - name: Follow command logs
+        id: poll
+        timeout-minutes: 66
+        env:
+          COMMAND_ID: ${{ steps.command.outputs.command-id }}
+          STARTED_AT: ${{ steps.command.outputs.started-at }}
+          LOG_GROUP: ${{ needs.resolve.outputs.log-group }}
+        run: |
+          set -euo pipefail
+          started=$((STARTED_AT / 1000))
+          cursor=$STARTED_AT
+          seen='[]'
+          received=false
+          while (( $(date +%s) - started < 3900 )); do
+            response=$(timeout 60s aws logs filter-log-events \
+              --log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/" \
+              --start-time "$cursor" --output json 2>/dev/null) || {
+              echo 'Could not read command logs' >&2
+              exit 1
+            }
+            events=$(jq -ce --argjson seen "$seen" \
+              '[.events[] | select(.eventId as $id | $seen | index($id) | not)]' <<< "$response")
+            if [[ $(jq 'length' <<< "$events") != 0 ]]; then
+              received=true
+              stop_token=$(openssl rand -hex 16)
+              printf '::stop-commands::%s\n' "$stop_token"
+              jq -r '.[].message' <<< "$events"
+              printf '::%s::\n' "$stop_token"
+              if deploy_exit=$(jq -er '
+                [.[].message | scan("\\{\\s*\"deployExit\"\\s*:\\s*([0-9]+)\\s*\\}") | .[0] | tonumber]
+                | if length > 0 then .[-1] else empty end
+              ' <<< "$events"); then
+                if [[ "$deploy_exit" == 0 ]]; then
+                  exit 0
+                fi
+                echo 'SSM deploy failed' >&2
+                exit 1
+              fi
+              # Keep the boundary inclusive so later events in the same millisecond survive.
+              cursor=$(jq '[.[].timestamp] | max' <<< "$events")
+              seen=$(jq -c --argjson cursor "$cursor" --argjson seen "$seen" \
+                '$seen + [.[] | select(.timestamp == $cursor) | .eventId] | unique' <<< "$events")
+            fi
+            if [[ "$received" == false ]] && (( $(date +%s) - started >= 600 )); then
+              echo 'Command was not delivered (agent offline?)' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo 'No deployExit marker within 65 minutes' >&2
+          exit 1
+      - name: Record deployment result
+        id: status
+        if: always() && steps.deployment.outputs.id != ''
+        env:
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+          RESULT: ${{ steps.poll.outcome == 'success' && 'success' || 'failure' }}
+        run: |
+          set -euo pipefail
+          timeout 60s gh api --method POST "repos/$REPO/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state="$RESULT" -f log_url="$RUN_URL" >/dev/null 2>&1 || {
+            echo 'Could not record deployment result' >&2
+            exit 1
+          }
+      - name: Notify Slack if configured
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          RESULT: ${{ steps.poll.outcome == 'success' && steps.status.outcome == 'success' && 'success' || 'failure' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            exit 0
+          fi
+          jq -n --arg text "$REPO $DEPLOY_ENVIRONMENT $MODE ${SHA:0:7} $RESULT $RUN_URL" \
+            '{text: $text}' | curl --silent --fail --connect-timeout 10 --max-time 30 \
+              -H 'Content-Type: application/json' --data-binary @- "$SLACK_WEBHOOK_URL" \
+              >/dev/null 2>&1 || {
+              echo 'Could not send deploy notification' >&2
+              exit 1
+            }
+      - name: Require successful deploy
+        if: always()
+        env:
+          RESULT: ${{ steps.poll.outcome == 'success' && steps.status.outcome == 'success' && 'success' || 'failure' }}
+        run: test "$RESULT" = success
