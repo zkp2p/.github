@@ -33,9 +33,13 @@ while pid > 1:
         root = executable.parent.parent
         if executable.parent.name != 'bin' or not root.is_relative_to('/home/runner'):
             raise SystemExit('Runner.Worker is outside the hosted runner directory')
-        node = root / 'externals/node24/bin/node'
-        if node.resolve(strict=True) != node or not node.is_file():
-            raise SystemExit('Bundled Node 24 must be a regular file in the actual runner directory')
+        node = (root / 'externals/node24/bin/node').resolve(strict=True)
+        # Hosted x64 runners link externals to this shared cache; ARM keeps it in root.
+        if not (node.is_relative_to(root) or node == Path('/opt/runner-cache/externals/node24/bin/node')):
+            raise SystemExit('Bundled Node 24 resolves outside the hosted runner installation')
+        # Hosted binaries may be owned by runner (the Worker owner), rather than root.
+        if not node.is_file() or node.stat().st_uid not in {0, executable.stat().st_uid}:
+            raise SystemExit('Bundled Node 24 must be a regular file owned by root or the Runner.Worker owner')
         print(node)
         break
     status = (proc / 'status').read_text().splitlines()

@@ -26,6 +26,12 @@ replaces that bundled binary using the hosted runner's existing sudo
 access. An already-fixed decoder is retained. It selects Node 24 for subsequent
 legacy JavaScript actions through GitHub's supported migration setting.
 
+Runtime symlinks are resolved before inspection or replacement. The target must
+be a regular file owned by root or the actual Worker's owner, inside that runner's
+installation or at `/opt/runner-cache/externals/node24/bin/node`. Hosted x64
+images link `externals` to that cache; ARM64 images keep it inside the installation.
+The replacement is staged beside the resolved target, retaining its owner and mode.
+
 On Ubuntu 24.04 it also patches the inspected native Brotli 1.1.0 ABI used by
 curl. The unchanged checksum-pinned builder produces paired Brotli 1.1.1 runtime
 and development packages, runs all 14 included upstream tests, and retains
