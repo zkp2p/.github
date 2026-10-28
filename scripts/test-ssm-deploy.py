@@ -43,6 +43,11 @@ class DeployTests(unittest.TestCase):
         self.tool("date", 'printf "%s\\n" "${NOW:-1000}"')
         self.tool("sleep", 'echo "unexpected sleep" >&2; exit 97')
         self.tool("docker", 'echo "unexpected Docker fallback" >&2; exit 98')
+        self.config = {
+            "region": "test-region", "ssmDocument": "test-document", "logGroup": "test-logs",
+            "environments": {"staging": {"branch": "releases/staging", "instanceId": "i-test",
+                                         "roleArn": "test-role", "ci": "skip"}},
+        }
 
     def tool(self, name, body):
         path = self.bin / name
@@ -59,16 +64,66 @@ class DeployTests(unittest.TestCase):
     def assert_exit(self, result, code):
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
-    def config_tool(self, name):
-        config = {"region": "test-region", "ssmDocument": "test-document", "logGroup": "test-logs",
-                  "environments": {"staging": {"branch": "releases/staging", "instanceId": "i-test",
-                                               "roleArn": "test-role", "ci": "skip"}}}
+    def config_tool(self, name, config=None):
+        if config is None:
+            config = self.config
         body = 'printf "%s\\n" \'' + json.dumps(config) + "'"
         if name == "yq":
             body = 'if [[ "$1" == --version ]]; then echo "$YQ_VERSION"; exit 0; fi\n' + body
         else:
             body = '[[ "$*" == *mikefarah/yq:4.44.3* ]]\n' + body
         self.tool(name, body)
+
+    def assert_resolved_values(self, region="test-region", document="test-document", log_group="test-logs"):
+        self.config_tool("docker")
+        self.assert_exit(self.run_step("resolve", "Resolve environment"), 0)
+        outputs = dict(line.split("=", 1) for line in (self.root / "outputs").read_text().splitlines())
+        self.assertEqual(outputs, {
+            "environment": "staging", "instance-id": "i-test", "role-arn": "test-role",
+            "region": region, "document": document, "log-group": log_group, "ci": "skip",
+        })
+
+    def test_resolve_environment_level_only(self):
+        environment = self.config["environments"]["staging"]
+        for key in ("region", "ssmDocument", "logGroup"):
+            environment[key] = self.config.pop(key)
+        self.assert_resolved_values()
+
+    def test_resolve_top_level_only(self):
+        self.assert_resolved_values()
+
+    def test_resolve_environment_overrides_top_level(self):
+        self.config["environments"]["staging"].update({
+            "region": "env-region", "ssmDocument": "env-document", "logGroup": "env-logs",
+        })
+        self.assert_resolved_values(region="env-region", document="env-document", log_group="env-logs")
+
+    def test_resolve_falls_back_per_field(self):
+        self.config["environments"]["staging"]["ssmDocument"] = "env-document"
+        self.assert_resolved_values(document="env-document")
+
+    def test_resolve_missing_at_both_levels_fails(self):
+        for key in ("region", "ssmDocument", "logGroup"):
+            with self.subTest(key=key):
+                config = {name: value for name, value in self.config.items() if name != key}
+                self.config_tool("docker", config)
+                result = self.run_step("resolve", "Resolve environment")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid environment configuration", result.stderr)
+                self.assertFalse((self.root / "outputs").exists())
+
+    def test_resolve_rejects_invalid_values(self):
+        for level in ("top", "environment"):
+            for key in ("region", "ssmDocument", "logGroup"):
+                for value in ("", "first\nsecond", "first\rsecond", 123, True, [], {}):
+                    with self.subTest(level=level, key=key, value=value):
+                        config = json.loads(json.dumps(self.config))
+                        target = config if level == "top" else config["environments"]["staging"]
+                        target[key] = value
+                        self.config_tool("docker", config)
+                        result = self.run_step("resolve", "Resolve environment")
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse((self.root / "outputs").exists())
 
     def test_native_yq(self):
         self.config_tool("yq")
