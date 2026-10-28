@@ -1,0 +1,120 @@
+name: Build deploy image for public repos
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        type: string
+        required: true
+      context:
+        type: string
+        default: .
+      image-name:
+        type: string
+        required: true
+      artifact-name:
+        type: string
+        required: true
+      build-args:
+        description: Newline-separated Docker build arguments.
+        type: string
+        default: ''
+      artifact-role-arn:
+        description: OIDC artifact writer role for the caller repository.
+        type: string
+        required: true
+    outputs:
+      artifact-key:
+        value: ${{ jobs.image.outputs.artifact-key }}
+      manifest-sha256:
+        value: ${{ jobs.image.outputs.manifest-sha256 }}
+      image-id:
+        value: ${{ jobs.image.outputs.image-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      artifact-key: ${{ steps.upload-s3.outputs.artifact-key }}
+      manifest-sha256: ${{ steps.package.outputs.manifest-sha256 }}
+      image-id: ${{ steps.package.outputs.image-id }}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+    steps:
+      - name: Require a trusted event for OIDC artifact uploads
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo 'OIDC artifact uploads require push or workflow_dispatch' >&2
+          exit 1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build immutable application image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          source = os.environ['SOURCE_SHA']
+          command = ['docker', 'build']
+          for argument in os.environ['BUILD_ARGS'].splitlines():
+              if argument.strip():
+                  command.extend(['--build-arg', argument])
+          command.extend([
+              '--build-arg', 'SOURCE_SHA=' + source,
+              '--label', 'org.opencontainers.image.revision=' + source,
+              '--label', 'org.opencontainers.image.source=https://github.com/' + os.environ['SOURCE_REPOSITORY'],
+              '-f', os.environ['DOCKERFILE'], '-t', os.environ['IMAGE_NAME'] + ':' + source,
+              os.environ['BUILD_CONTEXT'],
+          ])
+          subprocess.run(command, check=True, timeout=1800)
+          PY
+      - name: Assemble verified image artifact
+        id: package
+        run: |
+          set -euo pipefail
+          rm -rf artifact
+          mkdir artifact
+          docker save "$IMAGE_NAME:$SOURCE_SHA" | gzip > artifact/image.tar.gz
+          docker image inspect "$IMAGE_NAME:$SOURCE_SHA" --format '{{.Id}}' > artifact/image-id.txt
+          printf '%s\n' "$SOURCE_SHA" > artifact/source-sha.txt
+          cd artifact
+          # Keep the notification format: sorted relative paths, two spaces, no self-hash.
+          # shellcheck disable=SC2094
+          find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          echo "manifest-sha256=$(sha256sum SHA256SUMS | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "image-id=$(cat image-id.txt)" >> "$GITHUB_OUTPUT"
+      - name: Assume artifact writer role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.artifact-role-arn }}
+          role-session-name: build-${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Upload immutable image with OIDC
+        id: upload-s3
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/deploy-artifact.tar.gz"
+          tar -czf "$archive" -C artifact image.tar.gz image-id.txt source-sha.txt SHA256SUMS
+          key="$GITHUB_REPOSITORY/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$ARTIFACT_NAME.tar.gz"
+          aws s3 cp "$archive" "s3://zkp2p-gha-artifacts-411399509833/$key" --only-show-errors
+          echo "artifact-key=$key" >> "$GITHUB_OUTPUT"
