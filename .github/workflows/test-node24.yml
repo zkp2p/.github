@@ -1,0 +1,257 @@
+name: Verify hosted Node 24 fix (temporary)
+
+on:
+  push:
+    branches: [fix/patch-node24-hosted-layout]
+    paths:
+      - .github/workflows/test-node24.yml
+      - actions/patch-node24/**
+
+permissions:
+  contents: read
+
+jobs:
+  local:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Snapshot actual bundled runtime
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          pid = os.getppid()
+          while pid > 1:
+              proc = Path('/proc') / str(pid)
+              executable = (proc / 'exe').resolve(strict=True)
+              if executable.name == 'Runner.Worker':
+                  root = executable.parent.parent
+                  break
+              pid = int(next(line.split()[1] for line in (proc / 'status').read_text().splitlines()
+                             if line.startswith('PPid:')))
+          else:
+              raise SystemExit('No Worker ancestor')
+          node = root / 'externals/node24/bin/node'
+          target = node.resolve(strict=True)
+          info = target.stat()
+          fixed = subprocess.check_output([str(node), '-p', 'require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH === -17'], text=True).strip() == 'true'
+          receipt = dict(target=str(target), inode=info.st_ino, uid=info.st_uid, gid=info.st_gid,
+                         mode=info.st_mode, sha256=hashlib.sha256(target.read_bytes()).hexdigest(), fixed=fixed)
+          Path(os.environ['RUNNER_TEMP'], 'node24-before.json').write_text(json.dumps(receipt))
+          print(json.dumps(receipt))
+          PYCODE
+      - name: Patch via local action
+        uses: ./actions/patch-node24
+      - name: Verify JavaScript action uses fixed runtime
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            assert.equal(require('node:zlib').constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, -17);
+            assert.equal(process.env.FORCE_JAVASCRIPT_ACTIONS_TO_NODE24, 'true');
+            const before = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/node24-before.json`));
+            const target = fs.realpathSync(process.execPath);
+            const stat = fs.statSync(target);
+            const after = {target, inode:stat.ino, uid:stat.uid, gid:stat.gid, mode:stat.mode,
+              sha256:crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')};
+            assert.equal(target, before.target);
+            for (const key of ['uid', 'gid', 'mode']) assert.equal(after[key], before[key]);
+            if (before.fixed) {
+              assert.equal(after.inode, before.inode);
+              assert.equal(after.sha256, before.sha256);
+            } else {
+              assert.notEqual(after.inode, before.inode);
+              assert.notEqual(after.sha256, before.sha256);
+            }
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/node24-after.json`, JSON.stringify(after));
+            console.log(JSON.stringify({node:process.version, ...after, alreadyFixed:before.fixed}));
+      - name: Repeat action on already-fixed runtime
+        uses: ./actions/patch-node24
+      - name: Verify second invocation is a no-op
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const before = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/node24-after.json`));
+            const target = fs.realpathSync(process.execPath);
+            const stat = fs.statSync(target);
+            assert.equal(require('node:zlib').constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, -17);
+            assert.deepEqual({target, inode:stat.ino, uid:stat.uid, gid:stat.gid, mode:stat.mode,
+              sha256:crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')}, before);
+            console.log('Already-fixed runtime retained: target, inode, owner, mode, checksum unchanged');
+      - name: Exercise runtime path guards with isolated fixtures
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+
+          source = Path('actions/patch-node24/patch-node24.sh').read_text()
+          resolver = source.split("node=$(python3 <<'PY'\n", 1)[1].split('\nPY\n)', 1)[0]
+          with tempfile.TemporaryDirectory(prefix='node24-guards.', dir='/home/runner') as temporary:
+              root = Path(temporary)
+              worker = root / 'bin/Runner.Worker'
+              worker.parent.mkdir()
+              shutil.copy2('/bin/bash', worker)
+              node = root / 'externals/node24/bin/node'
+              node.parent.mkdir(parents=True)
+              node.write_text('fixture')
+              node.chmod(0o755)
+
+              def check(label, expected=None):
+                  # Keep the copied shell alive as a real /proc Worker ancestor.
+                  result = subprocess.run([str(worker), '-c', 'python3 -c "$RESOLVER"; result=$?; exit "$result"'],
+                      env={**os.environ, 'RESOLVER': resolver}, text=True, capture_output=True, timeout=10)
+                  if expected is None:
+                      assert result.returncode != 0, (label, result.stdout, result.stderr)
+                  else:
+                      assert result.returncode == 0, (label, result.stdout, result.stderr)
+                      assert result.stdout.strip() == str(expected), (label, result.stdout)
+                  print('PASS:', label)
+
+              check('direct worker-owned regular file', node)
+              subprocess.run(['sudo', '-n', 'chown', 'root:root', str(node)], check=True)
+              check('direct root-owned regular file', node)
+              subprocess.run(['sudo', '-n', 'chown', '65534:65534', str(node)], check=True)
+              check('reject unrelated owner')
+              node.unlink()
+              target = root / 'node-real'
+              target.write_text('fixture')
+              node.symlink_to(target)
+              check('resolve final symlink inside installation', target)
+              node.unlink()
+              node.symlink_to('/usr/bin/node')
+              check('reject target outside installation')
+              node.unlink()
+              node.mkdir()
+              check('reject directory target')
+              node.rmdir()
+              node.symlink_to(root / 'missing')
+              check('reject dangling symlink')
+              node.unlink()
+              node.symlink_to(node)
+              check('reject symlink loop')
+              node.unlink()
+              external = root / 'externals'
+              shutil.rmtree(external)
+              alternate = root / 'external-real'
+              (alternate / 'node24/bin').mkdir(parents=True)
+              target = alternate / 'node24/bin/node'
+              target.write_text('fixture')
+              external.symlink_to(alternate, target_is_directory=True)
+              check('resolve externals symlink inside installation', target)
+              external.unlink()
+              cached = Path('/opt/runner-cache/externals')
+              if cached.is_dir():
+                  external.symlink_to(cached, target_is_directory=True)
+                  check('accept observed hosted cache', cached / 'node24/bin/node')
+                  external.unlink()
+              # A sibling of the installation is not covered by the installation allowlist.
+              with tempfile.TemporaryDirectory(prefix='node24-outside.', dir='/home/runner') as outside:
+                  outside_root = Path(outside)
+                  (outside_root / 'node24/bin').mkdir(parents=True)
+                  (outside_root / 'node24/bin/node').write_text('fixture')
+                  external.symlink_to(outside_root, target_is_directory=True)
+                  check('reject arbitrary external directory')
+                  external.unlink()
+          PYCODE
+  remote:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Snapshot actual bundled runtime
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          pid = os.getppid()
+          while pid > 1:
+              proc = Path('/proc') / str(pid)
+              executable = (proc / 'exe').resolve(strict=True)
+              if executable.name == 'Runner.Worker':
+                  root = executable.parent.parent
+                  break
+              pid = int(next(line.split()[1] for line in (proc / 'status').read_text().splitlines()
+                             if line.startswith('PPid:')))
+          else:
+              raise SystemExit('No Worker ancestor')
+          node = root / 'externals/node24/bin/node'
+          target = node.resolve(strict=True)
+          info = target.stat()
+          fixed = subprocess.check_output([str(node), '-p', 'require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH === -17'], text=True).strip() == 'true'
+          receipt = dict(target=str(target), inode=info.st_ino, uid=info.st_uid, gid=info.st_gid,
+                         mode=info.st_mode, sha256=hashlib.sha256(target.read_bytes()).hexdigest(), fixed=fixed)
+          Path(os.environ['RUNNER_TEMP'], 'node24-before.json').write_text(json.dumps(receipt))
+          print(json.dumps(receipt))
+          PYCODE
+      - name: Patch via remote action
+        uses: zkp2p/.github/actions/patch-node24@f92953ec391e7d36896b8f9eea4dd3406e40346f
+      - name: Verify JavaScript action uses fixed runtime
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            assert.equal(require('node:zlib').constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, -17);
+            assert.equal(process.env.FORCE_JAVASCRIPT_ACTIONS_TO_NODE24, 'true');
+            const before = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/node24-before.json`));
+            const target = fs.realpathSync(process.execPath);
+            const stat = fs.statSync(target);
+            const after = {target, inode:stat.ino, uid:stat.uid, gid:stat.gid, mode:stat.mode,
+              sha256:crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')};
+            assert.equal(target, before.target);
+            for (const key of ['uid', 'gid', 'mode']) assert.equal(after[key], before[key]);
+            if (before.fixed) {
+              assert.equal(after.inode, before.inode);
+              assert.equal(after.sha256, before.sha256);
+            } else {
+              assert.notEqual(after.inode, before.inode);
+              assert.notEqual(after.sha256, before.sha256);
+            }
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/node24-after.json`, JSON.stringify(after));
+            console.log(JSON.stringify({node:process.version, ...after, alreadyFixed:before.fixed}));
+      - name: Repeat action on already-fixed runtime
+        uses: zkp2p/.github/actions/patch-node24@f92953ec391e7d36896b8f9eea4dd3406e40346f
+      - name: Verify second invocation is a no-op
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const before = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/node24-after.json`));
+            const target = fs.realpathSync(process.execPath);
+            const stat = fs.statSync(target);
+            assert.equal(require('node:zlib').constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, -17);
+            assert.deepEqual({target, inode:stat.ino, uid:stat.uid, gid:stat.gid, mode:stat.mode,
+              sha256:crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')}, before);
+            console.log('Already-fixed runtime retained: target, inode, owner, mode, checksum unchanged');
