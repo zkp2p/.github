@@ -103,9 +103,9 @@ jobs:
               environment: $match[0].key,
               "instance-id": $match[0].value.instanceId,
               "role-arn": $match[0].value.roleArn,
-              region: $config.region,
-              document: $config.ssmDocument,
-              "log-group": $config.logGroup,
+              region: ($match[0].value.region // $config.region),
+              document: ($match[0].value.ssmDocument // $config.ssmDocument),
+              "log-group": ($match[0].value.logGroup // $config.logGroup),
               ci: $match[0].value.ci
             }
             | if all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not))
