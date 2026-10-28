@@ -44,12 +44,64 @@ after both provider bundled and native decoders are independently verified fixed
 Sources: [Node security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
 and [official archive checksums](https://nodejs.org/dist/v24.22.1/SHASUMS256.txt).
 
+## Public repository image builds
+
+Use `.github/workflows/build-deploy-image-public.yml` for public repositories
+such as `zkp2p/peer-cli` that cannot call the reusable build workflow in the
+private `zkp2p/peer-infra` repository. It builds the caller's `github.sha` on
+`ubuntu-latest` and uploads an image artifact using AWS OIDC. Only caller events
+`push` and `workflow_dispatch` are accepted; other events fail before checkout.
+The runner is fixed and cannot be overridden by the caller.
+
+Pin the reusable workflow to a reviewed commit and grant the calling job
+`contents: read` and `id-token: write`:
+
+```yaml
+jobs:
+  image:
+    permissions:
+      contents: read
+      id-token: write
+    uses: zkp2p/.github/.github/workflows/build-deploy-image-public.yml@<full-reviewed-commit-sha>
+    with:
+      dockerfile: Dockerfile
+      image-name: example-service
+      artifact-name: deploy-image
+      artifact-role-arn: ${{ vars.ARTIFACT_ROLE_ARN }}
+      build-args: |
+        NODE_ENV=production
+```
+
+| Input | Contract |
+| --- | --- |
+| `dockerfile` | Required Dockerfile path in the caller checkout. |
+| `context` | Docker build context; default `.`. |
+| `image-name` | Required image name, tagged with the caller commit SHA. |
+| `artifact-name` | Required archive name, without the `.tar.gz` suffix. |
+| `build-args` | Newline-separated Docker build arguments; default empty. |
+| `artifact-role-arn` | Required caller-provided OIDC artifact writer role. |
+
+The writer role must trust the caller's intended branch-based OIDC subjects and
+permit uploads to its repository prefix in `zkp2p-gha-artifacts-411399509833`
+in `us-east-1`. The bucket name is the only fixed AWS account-specific value;
+the caller supplies the role ARN. This workflow has no smoke test, fleet upload,
+or runtime patch step.
+
+The build receives `SOURCE_SHA` and OCI revision/source labels. The archive
+contains `image.tar.gz`, `image-id.txt`, `source-sha.txt`, and `SHA256SUMS` using
+the private workflow's sorted relative-path manifest format. The workflow
+returns `artifact-key`, `manifest-sha256`, and `image-id` for the SSM deploy
+workflow below. `artifact-key` is the S3 key
+`<github.repository>/<run_id>/<run_attempt>/<artifact-name>.tar.gz`;
+`manifest-sha256` hashes `SHA256SUMS`, and `image-id` identifies the built image.
+Pass `github.sha` separately as the deploy workflow's `source-sha`.
+
 ## Reusable SSM deploy workflow
 
 `.github/workflows/ssm-deploy.yml` deploys through a caller-owned SSM document
 and follows its CloudWatch logs. Pin the reusable workflow to a reviewed commit.
-All infrastructure identifiers come from the caller's environment map; this
-public repository contains no deployment credentials or account configuration.
+All deployment infrastructure identifiers come from the caller's environment
+map; the SSM workflow contains no deployment credentials or account configuration.
 
 The caller's `deploy/environments.yml` uses this schema (replace placeholders
 in the caller repository):
@@ -160,16 +212,17 @@ No events after 10 minutes or no exit marker after
 command; the document must enforce its own execution timeout.
 
 Deployment status is recorded as `in_progress`, then `success` or `failure`, with
-a link to the workflow run. Hosted jobs use the runtime patch described above
+a link to the workflow run. Hosted SSM jobs use the runtime patch described above
 before JavaScript actions; self-hosted runner maintenance belongs to the caller.
 
 Run the local checks from the repository root (Docker must be running; the shell
-step harness also requires Python 3, jq and OpenSSL):
+step harnesses also require Python 3, jq, OpenSSL and `sha256sum`):
 
 ```bash
 bash scripts/test-ci-gate.sh # 4 passed
 python3 scripts/test-ssm-deploy.py
-actionlint .github/workflows/ssm-deploy.yml
+python3 scripts/test-build-deploy-image-public.py
+actionlint .github/workflows/*.yml
 ```
 
 The test extracts the workflow's `decide.env.DECISION_JQ` with
@@ -178,3 +231,8 @@ only, and empty results. The shell step harness checks yq selection, log
 pagination and deduplication, polling failures/timeouts, Slack failures, and the
 final success gate with isolated fake external commands. These checks do not
 exercise a live deployment or call AWS/GitHub APIs.
+
+The public build harness checks the event guard, fixed hosted runner, caller
+checkout, manifest format and outputs, archive contents, run-attempt-specific
+S3 keys, and failed uploads using local Docker/AWS stubs. It does not build a
+real application image or assume an AWS role.
