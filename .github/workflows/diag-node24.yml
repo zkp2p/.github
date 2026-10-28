@@ -1,0 +1,72 @@
+name: Diagnose hosted Node 24 layout (temporary)
+
+on:
+  push:
+    branches: [fix/patch-node24-hosted-layout]
+    paths: [.github/workflows/diag-node24.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  layout:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Inspect actual worker and bundled runtime
+        shell: bash
+        run: |
+          python3 -u <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def run(*args):
+              print('+', ' '.join(map(str, args)), flush=True)
+              try:
+                  result = subprocess.run(args, timeout=10, check=False)
+                  print('exit:', result.returncode, flush=True)
+              except subprocess.TimeoutExpired:
+                  print('timed out', flush=True)
+
+          for key in ('RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_ENVIRONMENT', 'RUNNER_NAME',
+                      'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'ImageOS', 'ImageVersion'):
+              print(key, '=', os.environ.get(key))
+          pid = os.getppid()
+          while pid > 1:
+              proc = Path('/proc') / str(pid)
+              executable = (proc / 'exe').resolve(strict=True)
+              print('ancestor:', pid, executable)
+              if executable.name == 'Runner.Worker':
+                  root = executable.parent.parent
+                  break
+              pid = int(next(line.split()[1] for line in (proc / 'status').read_text().splitlines()
+                             if line.startswith('PPid:')))
+          else:
+              raise SystemExit('No host Runner.Worker ancestor')
+
+          node = root / 'externals/node24/bin/node'
+          print('worker:', executable, 'runner root:', root, 'node:', node)
+          run(str(root / 'bin/Runner.Listener'), '--version')
+          run('stat', '-c', '%F %U:%G uid=%u gid=%g mode=%a %n', str(executable))
+          for component in [*reversed(node.parents), node]:
+              run('ls', '-ld', str(component))
+              run('readlink', '-f', str(component))
+          target = node.resolve(strict=True)
+          print('resolved target:', target, 'old guard accepts:', target == node and node.is_file())
+          for component in [*reversed(target.parents), target]:
+              run('stat', '-c', '%F %U:%G uid=%u gid=%g mode=%a %n', str(component))
+          run(str(node), '-p', 'JSON.stringify({execPath:process.execPath,node:process.versions.node,brotli:process.versions.brotli,blockSwitch:require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH,fixed:require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH === -17})')
+          PY
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Reproduce current script result
+        continue-on-error: true
+        shell: bash
+        run: bash actions/patch-node24/patch-node24.sh
