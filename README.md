@@ -183,7 +183,7 @@ the final success gate depends only on log polling and deployment-status recordi
 | `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
-| `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `14400` inclusive. Maximum time to follow the host command, in seconds. |
+| `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `6600` inclusive. Maximum time to follow the host command, in seconds. |
 | `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
 
 The host timeout is validated before checkout or CI gating. The follow step timeout
@@ -191,6 +191,11 @@ is `ceil(host-timeout-seconds / 60) + 1` minutes; the deploy job timeout is
 `ceil(host-timeout-seconds / 60) + 15` minutes. The default preserves the existing
 66-minute step and 80-minute job limits. For example, `host-timeout-seconds: 5700`
 follows for 95 minutes, with a 96-minute step and a 110-minute job.
+
+The maximum is 6600 seconds because the deploy job's AWS credentials last 7200
+seconds, also the module role's maximum session duration. This leaves 600 seconds
+of headroom for delivery and the steps before log following; longer follows could
+outlast the credentials and lose CloudWatch access.
 
 Environment resolution uses the runner's preinstalled mikefarah/yq, verified by
 `yq --version`, and falls back to `mikefarah/yq:4.44.3` in Docker only when yq is

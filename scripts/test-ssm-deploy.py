@@ -75,7 +75,7 @@ class DeployTests(unittest.TestCase):
         self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
         for seconds, follow, deploy in ((600, 11, 25), (601, 12, 26), (3899, 66, 80),
                                         (3900, 66, 80), (3901, 67, 81), (5700, 96, 110),
-                                        (14400, 241, 255)):
+                                        (6599, 111, 125), (6600, 111, 125)):
             with self.subTest(seconds=seconds):
                 result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=str(seconds))
                 self.assert_exit(result, 0)
@@ -85,12 +85,13 @@ class DeployTests(unittest.TestCase):
 
     def test_invalid_host_timeout_fails_before_outputs(self):
         self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
-        for value in ("", "0", "-1", "599", "14401", "600.5", "3900.1", "1e20",
-                      "18446744073709552216", "abc", "600\nother=value"):
+        for value in ("", "0", "-1", "599", "6601", "7200", "14400", "14401", "600.5", "3900.1",
+                      "1e20", "18446744073709552216", "abc", "600\nother=value"):
             with self.subTest(value=value):
+                (self.root / "outputs").unlink(missing_ok=True)
                 result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=value)
                 self.assert_exit(result, 1)
-                self.assertIn("host-timeout-seconds must be an integer between 600 and 14400", result.stderr)
+                self.assertIn("host-timeout-seconds must be an integer between 600 and 6600", result.stderr)
                 self.assertFalse((self.root / "outputs").exists())
 
     def config_tool(self, name, config=None):
@@ -430,7 +431,7 @@ if [[ -f "$STATE/index" ]]; then echo 4900; else echo 1000; fi
         self.assert_log_messages(result, [marker["message"]])
 
     def test_custom_host_timeout_expires_at_deadline(self):
-        for seconds in (600, 601, 5700, 14400):
+        for seconds in (600, 601, 5700, 6600):
             with self.subTest(seconds=seconds):
                 result = self.run_step("deploy", "Follow command logs",
                                        HOST_TIMEOUT_SECONDS=str(seconds), NOW=str(1000 + seconds))

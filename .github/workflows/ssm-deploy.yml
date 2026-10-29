@@ -28,7 +28,7 @@ on:
         type: string
         default: ci.yml
       host-timeout-seconds:
-        description: Maximum seconds to follow the host command (integer, 600..14400).
+        description: Maximum seconds to follow the host command (integer, 600..6600).
         type: number
         default: 3900
       runner:
@@ -70,9 +70,11 @@ jobs:
           HOST_TIMEOUT_SECONDS: ${{ inputs.host-timeout-seconds }}
         run: |
           set -euo pipefail
+          # Leave 600 seconds for delivery and pre-follow steps within the deploy
+          # role's 7200-second session so CloudWatch access does not expire mid-follow.
           if [[ ! "$HOST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{2,4}$ ]] ||
-             (( HOST_TIMEOUT_SECONDS < 600 || HOST_TIMEOUT_SECONDS > 14400 )); then
-            echo 'host-timeout-seconds must be an integer between 600 and 14400' >&2
+             (( HOST_TIMEOUT_SECONDS < 600 || HOST_TIMEOUT_SECONDS > 6600 )); then
+            echo 'host-timeout-seconds must be an integer between 600 and 6600' >&2
             exit 1
           fi
           # Round up, retaining the existing 1-minute follow and 15-minute job margins.
