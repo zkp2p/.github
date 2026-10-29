@@ -34,6 +34,7 @@ class DeployTests(unittest.TestCase):
             "PATH": str(self.bin), "HOME": str(self.root), "STATE": str(self.root),
             "GITHUB_OUTPUT": str(self.root / "outputs"),
             "COMMAND_ID": "test-command", "STARTED_AT": "1000000", "LOG_GROUP": "test",
+            "HOST_TIMEOUT_SECONDS": "3900",
             "ENVIRONMENTS_FILE": "environments.yml", "REF": "releases/staging",
             "SLACK_WEBHOOK_URL": "https://example.invalid/webhook",
             "REPO": "example/repo", "DEPLOY_ENVIRONMENT": "staging", "MODE": "image",
@@ -63,6 +64,35 @@ class DeployTests(unittest.TestCase):
 
     def assert_exit(self, result, code):
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+
+    def test_host_timeout_input(self):
+        host_timeout = WORKFLOW["on"]["workflow_call"]["inputs"].get("host-timeout-seconds", {})
+        self.assertEqual(host_timeout.get("type"), "number")
+        self.assertEqual(host_timeout.get("default"), 3900)
+        self.assertFalse(host_timeout.get("required", False))
+
+    def test_host_timeout_minutes(self):
+        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
+        for seconds, follow, deploy in ((600, 11, 25), (601, 12, 26), (3899, 66, 80),
+                                        (3900, 66, 80), (3901, 67, 81), (5700, 96, 110),
+                                        (6599, 111, 125), (6600, 111, 125)):
+            with self.subTest(seconds=seconds):
+                result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=str(seconds))
+                self.assert_exit(result, 0)
+                outputs = dict(line.split("=", 1) for line in (self.root / "outputs").read_text().splitlines())
+                self.assertEqual(outputs["follow-timeout-minutes"], str(follow))
+                self.assertEqual(outputs["deploy-timeout-minutes"], str(deploy))
+
+    def test_invalid_host_timeout_fails_before_outputs(self):
+        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
+        for value in ("", "0", "-1", "599", "6601", "7200", "14400", "14401", "600.5", "3900.1",
+                      "1e20", "18446744073709552216", "abc", "600\nother=value"):
+            with self.subTest(value=value):
+                (self.root / "outputs").unlink(missing_ok=True)
+                result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=value)
+                self.assert_exit(result, 1)
+                self.assertIn("host-timeout-seconds must be an integer between 600 and 6600", result.stderr)
+                self.assertFalse((self.root / "outputs").exists())
 
     def config_tool(self, name, config=None):
         if config is None:
@@ -391,6 +421,32 @@ if [[ -f "$STATE/index" ]]; then echo 4900; else echo 1000; fi
         result = self.run_step("deploy", "Follow command logs", NOW="4900")
         self.assert_exit(result, 1)
         self.assertIn("No deployExit marker", result.stderr)
+
+    def test_longer_host_timeout_allows_late_success(self):
+        marker = self.event("exit", 4900000, '{"deployExit": 0}')
+        self.pages([{"events": [marker]}, {"events": [marker]}])
+        self.record_sleeps()
+        result = self.run_step("deploy", "Follow command logs", HOST_TIMEOUT_SECONDS="5700", NOW="4900")
+        self.assert_exit(result, 0)
+        self.assert_log_messages(result, [marker["message"]])
+
+    def test_custom_host_timeout_expires_at_deadline(self):
+        for seconds in (600, 601, 5700, 6600):
+            with self.subTest(seconds=seconds):
+                result = self.run_step("deploy", "Follow command logs",
+                                       HOST_TIMEOUT_SECONDS=str(seconds), NOW=str(1000 + seconds))
+                self.assert_exit(result, 1)
+                self.assertIn(f"No deployExit marker within {seconds} seconds", result.stderr)
+
+    def test_pagination_respects_custom_host_timeout(self):
+        self.pages([{"events": [], "nextToken": "another-page"}])
+        self.tool("date", '''
+if [[ -f "$STATE/index" ]]; then echo 1601; else echo 1000; fi
+''')
+        result = self.run_step("deploy", "Follow command logs", HOST_TIMEOUT_SECONDS="601")
+        self.assert_exit(result, 1)
+        self.assertIn("No deployExit marker within 601 seconds", result.stderr)
+        self.assertEqual((self.root / "requests").read_text().splitlines(), ["1000000:"])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,10 @@ on:
       ci-workflow:
         type: string
         default: ci.yml
+      host-timeout-seconds:
+        description: Maximum seconds to follow the host command (integer, 600..6600).
+        type: number
+        default: 3900
       runner:
         type: string
         default: ubuntu-latest
@@ -54,10 +58,29 @@ jobs:
       document: ${{ steps.resolve.outputs.document }}
       log-group: ${{ steps.resolve.outputs.log-group }}
       ci: ${{ steps.resolve.outputs.ci }}
+      follow-timeout-minutes: ${{ steps.timeouts.outputs.follow-timeout-minutes }}
+      deploy-timeout-minutes: ${{ steps.timeouts.outputs.deploy-timeout-minutes }}
     steps:
       - name: Patch hosted action runtime
         if: runner.environment == 'github-hosted'
         uses: zkp2p/.github/actions/patch-node24@f9560a725dbcda32544968f34d52382d3af316e5 # reviewed runtime patch
+      - name: Validate host timeout
+        id: timeouts
+        env:
+          HOST_TIMEOUT_SECONDS: ${{ inputs.host-timeout-seconds }}
+        run: |
+          set -euo pipefail
+          # Leave 600 seconds for delivery and pre-follow steps within the deploy
+          # role's 7200-second session so CloudWatch access does not expire mid-follow.
+          if [[ ! "$HOST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{2,4}$ ]] ||
+             (( HOST_TIMEOUT_SECONDS < 600 || HOST_TIMEOUT_SECONDS > 6600 )); then
+            echo 'host-timeout-seconds must be an integer between 600 and 6600' >&2
+            exit 1
+          fi
+          # Round up, retaining the existing 1-minute follow and 15-minute job margins.
+          minutes=$(( (HOST_TIMEOUT_SECONDS + 59) / 60 ))
+          printf 'follow-timeout-minutes=%s\ndeploy-timeout-minutes=%s\n' \
+            "$((minutes + 1))" "$((minutes + 15))" >> "$GITHUB_OUTPUT"
       - name: Check out caller environment map
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -175,7 +198,7 @@ jobs:
     needs: [resolve, ci-gate]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped') }}
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 80
+    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.deploy-timeout-minutes) }}
     permissions:
       id-token: write
       deployments: write
@@ -298,11 +321,12 @@ jobs:
           printf 'command-id=%s\nstarted-at=%s\n' "$command_id" "$started_at" >> "$GITHUB_OUTPUT"
       - name: Follow command logs
         id: poll
-        timeout-minutes: 66
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.follow-timeout-minutes) }}
         env:
           COMMAND_ID: ${{ steps.command.outputs.command-id }}
           STARTED_AT: ${{ steps.command.outputs.started-at }}
           LOG_GROUP: ${{ needs.resolve.outputs.log-group }}
+          HOST_TIMEOUT_SECONDS: ${{ inputs.host-timeout-seconds }}
         run: |
           set -euo pipefail
           started=$((STARTED_AT / 1000))
@@ -313,11 +337,11 @@ jobs:
           # Late ingestion can put new events before any previously seen timestamp.
           log_args=(--log-group-name "$LOG_GROUP" --log-stream-name-prefix "$COMMAND_ID/"
             --start-time "$STARTED_AT" --no-paginate --output json)
-          while (( $(date +%s) - started < 3900 )); do
+          while (( $(date +%s) - started < HOST_TIMEOUT_SECONDS )); do
             events='[]'
             page_args=("${log_args[@]}")
             while :; do
-              if (( $(date +%s) - started >= 3900 )); then
+              if (( $(date +%s) - started >= HOST_TIMEOUT_SECONDS )); then
                 break 2
               fi
               response=$(timeout 60s aws logs filter-log-events "${page_args[@]}" 2>/dev/null) || {
@@ -364,7 +388,7 @@ jobs:
             fi
             sleep 15
           done
-          echo 'No deployExit marker within 65 minutes' >&2
+          printf 'No deployExit marker within %s seconds\n' "$HOST_TIMEOUT_SECONDS" >&2
           exit 1
       - name: Record deployment result
         id: status

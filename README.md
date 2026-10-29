@@ -183,7 +183,19 @@ the final success gate depends only on log polling and deployment-status recordi
 | `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
+| `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `6600` inclusive. Maximum time to follow the host command, in seconds. |
 | `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
+
+The host timeout is validated before checkout or CI gating. The follow step timeout
+is `ceil(host-timeout-seconds / 60) + 1` minutes; the deploy job timeout is
+`ceil(host-timeout-seconds / 60) + 15` minutes. The default preserves the existing
+66-minute step and 80-minute job limits. For example, `host-timeout-seconds: 5700`
+follows for 95 minutes, with a 96-minute step and a 110-minute job.
+
+The maximum is 6600 seconds because the deploy job's AWS credentials last 7200
+seconds, also the module role's maximum session duration. This leaves 600 seconds
+of headroom for delivery and the steps before log following; longer follows could
+outlast the credentials and lose CloudWatch access.
 
 Environment resolution uses the runner's preinstalled mikefarah/yq, verified by
 `yq --version`, and falls back to `mikefarah/yq:4.44.3` in Docker only when yq is
@@ -213,9 +225,9 @@ printed event IDs are deduplicated, and each poll's new events are printed in
 timestamp and event ID order so late ingestion cannot skip earlier events.
 After an exit marker, the poller waits 10 seconds and performs one final full
 read before exiting with the marker's status.
-No events after 10 minutes or no exit marker after
-65 minutes fails the workflow. A workflow timeout does not cancel the host
-command; the document must enforce its own execution timeout.
+No events after 10 minutes or no exit marker within `host-timeout-seconds`
+(65 minutes by default) fails the workflow. A workflow timeout does not cancel
+the host command; the document must enforce its own execution timeout.
 
 Deployment status is recorded as `in_progress`, then `success` or `failure`, with
 a link to the workflow run. Hosted SSM jobs use the runtime patch described above
@@ -233,10 +245,10 @@ actionlint .github/workflows/*.yml
 
 The test extracts the workflow's `decide.env.DECISION_JQ` with
 `mikefarah/yq:4.44.3` and checks success, failure with an unfinished run, failure
-only, and empty results. The shell step harness checks yq selection, log
-pagination and deduplication, polling failures/timeouts, Slack failures, and the
-final success gate with isolated fake external commands. These checks do not
-exercise a live deployment or call AWS/GitHub APIs.
+only, and empty results. The shell step harness checks host timeout validation and
+rounding, yq selection, log pagination and deduplication, polling failures/timeouts,
+Slack failures, and the final success gate with isolated fake external commands.
+These checks do not exercise a live deployment or call AWS/GitHub APIs.
 
 The public build harness checks the event guard, fixed hosted runner, caller
 checkout, manifest format and outputs, archive contents, run-attempt-specific
