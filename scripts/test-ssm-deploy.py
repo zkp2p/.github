@@ -192,6 +192,22 @@ class DeployTests(unittest.TestCase):
     def test_slack_unconfigured(self):
         self.assert_exit(self.run_step("deploy", "Notify Slack if configured", SLACK_WEBHOOK_URL=""), 0)
 
+    def test_parameters_carry_run_identity(self):
+        normalize = step("deploy", "Normalize deploy parameters")
+        self.assertEqual((normalize["env"]["RUN_ID"], normalize["env"]["RUN_ATTEMPT"]),
+                         ("${{ github.run_id }}", "${{ github.run_attempt }}"))
+        image = {"MODE": "image", "ARTIFACT_KEY": "example/repo/41051883943/2/image.tar.gz",
+                 "MANIFEST_SHA256": "b" * 64, "IMAGE_ID": "sha256:" + "c" * 64, "SOURCE_SHA": "a" * 40}
+        for mode, values in (("image", image), ("config", {"MODE": "config"})):
+            with self.subTest(mode=mode):
+                result = self.run_step("deploy", "Normalize deploy parameters", RUNNER_TEMP=str(self.root),
+                                       ALLOW_KEY_REMOVAL="false", RUN_ID="41051883943", RUN_ATTEMPT="2", **values)
+                self.assert_exit(result, 0)
+                parameters = json.loads((self.root / "ssm-parameters.json").read_text())
+                self.assertEqual((parameters["RunId"], parameters["RunAttempt"]), (["41051883943"], ["2"]))
+                self.assertEqual(sorted(parameters), ["AllowKeyRemoval", "ArtifactKey", "ImageId", "ManifestSha256",
+                                                      "Mode", "RunAttempt", "RunId", "SourceSha"])
+
     def test_config_plan_skips_deployment_records(self):
         self.assertEqual(step("deploy", "Create GitHub deployment").get("if"),
                          "inputs.mode != 'config-plan'")
