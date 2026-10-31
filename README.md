@@ -216,9 +216,13 @@ this gate.
 The deploy role must support a 7,200-second OIDC session and permit sending only
 the intended document to its target instance, plus reading its CloudWatch log
 group. The workflow never queries SSM command status. Its document must accept
-`Mode`, `ArtifactKey`, `ManifestSha256`, `ImageId`, `SourceSha` and
-`AllowKeyRemoval`, write value-safe logs under the command ID stream prefix, and
-emit `{"deployExit": N}` when finished. Zero means success; a nonzero marker fails
+`Mode`, `ArtifactKey`, `ManifestSha256`, `ImageId`, `SourceSha`,
+`AllowKeyRemoval`, `RunId` and `RunAttempt`, write value-safe logs under the
+command ID stream prefix, and emit `{"deployExit": N}` when finished. `RunId` and
+`RunAttempt` are the caller's `github.run_id` and `github.run_attempt`, so hosts
+can name per-attempt receipts. SSM rejects a command that sends a parameter its
+document does not define: pin a commit that sends them only after the caller's
+documents define both. Zero means success; a nonzero marker fails
 the deployment. Logs are polled every 15 seconds from the fixed command start
 time, following every `nextToken`, including through empty pages. Previously
 printed event IDs are deduplicated, and each poll's new events are printed in
