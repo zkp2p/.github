@@ -63,7 +63,7 @@ jobs:
     steps:
       - name: Patch hosted action runtime
         if: runner.environment == 'github-hosted'
-        uses: zkp2p/.github/actions/patch-node24@f9560a725dbcda32544968f34d52382d3af316e5 # reviewed runtime patch
+        uses: zkp2p/.github/actions/patch-node24@4ef0030bb0aca98a6c4a6378dbf48ad159ff25d4 # reviewed runtime patch
       - name: Validate host timeout
         id: timeouts
         env:
@@ -215,7 +215,7 @@ jobs:
     steps:
       - name: Patch hosted action runtime
         if: runner.environment == 'github-hosted'
-        uses: zkp2p/.github/actions/patch-node24@f9560a725dbcda32544968f34d52382d3af316e5 # reviewed runtime patch
+        uses: zkp2p/.github/actions/patch-node24@4ef0030bb0aca98a6c4a6378dbf48ad159ff25d4 # reviewed runtime patch
       - name: Normalize deploy parameters
         id: normalize
         env:
