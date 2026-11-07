@@ -1,5 +1,5 @@
 name: Patch hosted action Node 24
-description: Patch bundled Node 24 and Ubuntu 24.04 native Brotli before main steps
+description: Patch bundled Node 24 and verify Ubuntu native Brotli, rebuilding only on 24.04
 runs:
   using: composite
   steps:
