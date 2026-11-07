@@ -1,0 +1,38 @@
+name: Test patch-node24
+
+on:
+  pull_request:
+    paths:
+      - actions/patch-node24/**
+      - scripts/test-patch-native-brotli.py
+      - .github/workflows/test-patch-node24.yml
+      - README.md
+  push:
+    branches: [main]
+    paths:
+      - actions/patch-node24/**
+      - scripts/test-patch-native-brotli.py
+      - .github/workflows/test-patch-node24.yml
+      - README.md
+
+permissions:
+  contents: read
+
+jobs:
+  patch-node24:
+    name: patch-node24 (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 10
+    steps:
+      # Checkout is needed here to exercise the PR's local action.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test native Brotli release gates
+        run: python3 scripts/test-patch-native-brotli.py
+      - name: Patch hosted runtimes
+        uses: ./actions/patch-node24

@@ -1,4 +1,4 @@
-"""Patch the concrete Ubuntu 24.04 shared Brotli ABI before subsequent steps."""
+"""Verify native Brotli; rebuild only the inspected Ubuntu 24.04 shared ABI."""
 
 import hashlib
 import json
@@ -35,7 +35,7 @@ def probe():
     # A fresh process is required after dpkg: an already-loaded SONAME is cached.
     code = """import ctypes,ctypes.util,json
 library=ctypes.util.find_library('brotlidec')
-if library!='libbrotlidec.so.1': raise SystemExit('unsupported native Brotli SONAME')
+if library!='libbrotlidec.so.1': raise SystemExit(f'unsupported native Brotli SONAME: expected libbrotlidec.so.1, found {library!r}')
 lib=ctypes.CDLL(library)
 lib.BrotliDecoderVersion.restype=ctypes.c_uint32
 lib.BrotliDecoderErrorString.argtypes=[ctypes.c_int]
@@ -53,20 +53,23 @@ def symbols(path, static=False):
     }
 
 
+current = probe()
 release = dict(
     line.split("=", 1)
     for line in Path("/etc/os-release").read_text().splitlines()
     if "=" in line
 )
-if (
-    release.get("ID", "").strip('"') != "ubuntu"
-    or release.get("VERSION_ID", "").strip('"') != "24.04"
-):
-    raise SystemExit("Native Brotli bootstrap requires Ubuntu 24.04")
-current = probe()
+if release.get("ID", "").strip('"') != "ubuntu":
+    raise SystemExit("Native Brotli bootstrap requires Ubuntu")
 if current["blockSwitch"] == "_ERROR_FORMAT_BLOCK_SWITCH":
     print(json.dumps({"nativeBrotli": current, "changed": False}))
     sys.exit(0)
+ubuntu_version = release.get("VERSION_ID", "").strip('"')
+if ubuntu_version != "24.04":
+    raise SystemExit(
+        f"Native Brotli decoder is not fixed on Ubuntu {ubuntu_version} "
+        f"(decoder version {current['version']:#x}); rebuilding requires Ubuntu 24.04"
+    )
 if current["version"] != 0x1001000:
     raise SystemExit(
         "Native Brotli bootstrap requires the inspected 1.1.0 ABI or an already-fixed decoder"

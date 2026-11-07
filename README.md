@@ -32,20 +32,30 @@ installation or at `/opt/runner-cache/externals/node24/bin/node`. Hosted x64
 images link `externals` to that cache; ARM64 images keep it inside the installation.
 The replacement is staged beside the resolved target, retaining its owner and mode.
 
-On Ubuntu 24.04 it also patches the inspected native Brotli 1.1.0 ABI used by
-curl. The unchanged checksum-pinned builder produces paired Brotli 1.1.1 runtime
+It probes the native Brotli decoder first. Already-fixed native decoders on any
+Ubuntu release, including 26.04, skip the build and installation. The probe
+requires `libbrotlidec.so.1` and `_ERROR_FORMAT_BLOCK_SWITCH`; an unsupported
+SONAME fails closed. An unfixed decoder can only be rebuilt on Ubuntu 24.04 with
+the inspected Brotli 1.1.0 ABI used by curl. Other releases fail closed with the
+Ubuntu release and decoder version.
+
+The unchanged checksum-pinned builder produces paired Brotli 1.1.1 runtime
 and development packages, runs all 14 included upstream tests, and retains
 shared/static ABI symbols and existing development files. Only those two
 packages are installed; no package index or unrelated package is upgraded.
-Already-fixed native decoders skip the build and installation. Original package
-inventories, full build/install logs and receipts remain private in RUNNER_TEMP.
-Downloads never request automatic content decompression.
+Original package inventories, full build/install logs and receipts remain private
+in RUNNER_TEMP. Downloads never request automatic content decompression.
 
-Ubuntu 24.04 x64 and arm64 are supported; other hosts and container jobs fail
-closed. System Node, application dependencies and permission policy are
-unchanged. Select an explicit fixed Node version with setup-node for job tools.
+Ubuntu x64 and arm64 hosted runners are supported subject to those native decoder
+checks; other hosts and container jobs fail closed. System Node, application
+dependencies and permission policy are unchanged. Select an explicit fixed Node
+version with setup-node for job tools.
 This is a per-job measure while hosted images roll out the fix. Remove the step
 after both provider bundled and native decoders are independently verified fixed.
+
+The `Test patch-node24` workflow runs the local action on GitHub-hosted
+`ubuntu-24.04` and `ubuntu-26.04` runners. Run the isolated release-gate tests
+locally with `python3 scripts/test-patch-native-brotli.py`.
 
 Sources: [Node security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
 and [official archive checksums](https://nodejs.org/dist/v24.22.1/SHASUMS256.txt).
