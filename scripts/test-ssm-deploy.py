@@ -39,6 +39,11 @@ class DeployTests(unittest.TestCase):
             "SLACK_WEBHOOK_URL": "https://example.invalid/webhook",
             "REPO": "example/repo", "DEPLOY_ENVIRONMENT": "staging", "MODE": "image",
             "SHA": "a" * 40, "RESULT": "success", "RUN_URL": "https://example.invalid/run",
+            "ARTIFACT_KIND": "docker", "EIF_ENABLED": "",
+            "ARTIFACT_KEY": "example/repo/41051883943/2/image.tar.gz",
+            "MANIFEST_SHA256": "b" * 64, "IMAGE_ID": "sha256:" + "c" * 64,
+            "SOURCE_SHA": "a" * 40, "ALLOW_KEY_REMOVAL": "false",
+            "RUN_ID": "41051883943", "RUN_ATTEMPT": "2", "RUNNER_TEMP": str(self.root),
         }
         self.tool("timeout", 'shift\nexec "$@"')
         self.tool("date", 'printf "%s\\n" "${NOW:-1000}"')
@@ -73,7 +78,7 @@ class DeployTests(unittest.TestCase):
 
     def test_host_timeout_minutes(self):
         self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
-        for seconds, follow, deploy in ((600, 11, 25), (601, 12, 26), (3899, 66, 80),
+        for seconds, follow, deploy in ((600, 11, 25), (601, 12, 26), (2400, 41, 55), (3899, 66, 80),
                                         (3900, 66, 80), (3901, 67, 81), (5700, 96, 110),
                                         (6599, 111, 125), (6600, 111, 125)):
             with self.subTest(seconds=seconds):
@@ -207,6 +212,165 @@ class DeployTests(unittest.TestCase):
                 self.assertEqual((parameters["RunId"], parameters["RunAttempt"]), (["41051883943"], ["2"]))
                 self.assertEqual(sorted(parameters), ["AllowKeyRemoval", "ArtifactKey", "ImageId", "ManifestSha256",
                                                       "Mode", "RunAttempt", "RunId", "SourceSha"])
+
+    def normalize_parameters(self, **env):
+        result = self.run_step("resolve", "Validate artifact identity", **env)
+        if result.returncode != 0:
+            return result
+        return self.run_step("deploy", "Normalize deploy parameters", **env)
+
+    def test_artifact_kind_defaults_to_docker(self):
+        self.assertEqual(set(WORKFLOW["on"]), {"workflow_call"})
+        artifact_kind = WORKFLOW["on"]["workflow_call"]["inputs"].get("artifact-kind", {})
+        self.assertEqual(artifact_kind.get("type"), "string")
+        self.assertEqual(artifact_kind.get("default"), "docker")
+        self.assertFalse(artifact_kind.get("required", False))
+
+    def test_artifact_validation_precedes_external_actions(self):
+        resolve = WORKFLOW["jobs"]["resolve"]
+        self.assertEqual(resolve["steps"][0]["name"], "Validate artifact identity")
+        validation = resolve["steps"][0]
+        self.assertNotIn("if", validation)
+        self.assertFalse(validation.get("continue-on-error", False))
+        self.assertEqual(validation["env"], {
+            "MODE": "${{ inputs.mode }}", "ARTIFACT_KIND": "${{ inputs.artifact-kind }}",
+            "IMAGE_ID": "${{ inputs.image-id }}", "ALLOW_KEY_REMOVAL": "${{ inputs.allow-key-removal }}",
+            "EIF_ENABLED": "${{ vars.SSM_DEPLOY_EIF_ENABLED }}",
+        })
+        gate = WORKFLOW["jobs"]["ci-gate"]
+        self.assertEqual(gate["needs"], "resolve")
+        self.assertEqual(gate["if"], "needs.resolve.outputs.ci == 'required' && inputs.mode == 'image'")
+        deploy = WORKFLOW["jobs"]["deploy"]
+        self.assertEqual(deploy["needs"], ["resolve", "ci-gate"])
+        self.assertIn("needs.resolve.result == 'success'", deploy["if"])
+        self.assertIn("needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped'", deploy["if"])
+        self.assertEqual(step("ci-gate", "Wait for CI on the image commit")["env"]["SHA"],
+                         "${{ inputs.source-sha }}")
+
+    def test_docker_and_eif_parameter_contract(self):
+        for kind, identity, artifact in (
+            ("docker", "sha256:" + "c" * 64, "image"),
+            ("eif", "pcr0:" + "0123456789abcdef" * 6, "attestation-eif"),
+        ):
+            with self.subTest(kind=kind):
+                key = f"example/repo/41051883943/2/{artifact}.tar.gz"
+                result = self.normalize_parameters(ARTIFACT_KIND=kind, IMAGE_ID=identity,
+                                                   ARTIFACT_KEY=key, EIF_ENABLED="true")
+                self.assert_exit(result, 0)
+                path = self.root / "ssm-parameters.json"
+                self.assertEqual(json.loads(path.read_text()), {
+                    "Mode": ["image"], "ArtifactKey": [key], "ManifestSha256": ["b" * 64],
+                    "ImageId": [identity], "SourceSha": ["a" * 40], "AllowKeyRemoval": ["false"],
+                    "RunId": ["41051883943"], "RunAttempt": ["2"],
+                })
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_config_modes_keep_legacy_normalization(self):
+        for mode in ("config", "config-plan"):
+            for allow in ("false", "true"):
+                with self.subTest(mode=mode, allow=allow):
+                    # Artifact fields are ignored for config, even when nonempty or invalid.
+                    result = self.normalize_parameters(MODE=mode, ALLOW_KEY_REMOVAL=allow,
+                                                       IMAGE_ID="pcr0:ignored", MANIFEST_SHA256="ignored",
+                                                       ARTIFACT_KEY="ignored", SOURCE_SHA="ignored")
+                    self.assert_exit(result, 0)
+                    self.assertEqual(json.loads((self.root / "ssm-parameters.json").read_text()), {
+                        "Mode": [mode], "ArtifactKey": ["none"], "ManifestSha256": ["none"],
+                        "ImageId": ["none"], "SourceSha": ["none"], "AllowKeyRemoval": [allow],
+                        "RunId": ["41051883943"], "RunAttempt": ["2"],
+                    })
+
+    def test_invalid_artifact_identity_fails_before_external_calls(self):
+        for name in ("aws", "gh", "curl", "docker"):
+            self.tool(name, 'echo called >> "$STATE/external-calls"; exit 99')
+        cases = [
+            {"ARTIFACT_KIND": kind, "IMAGE_ID": identity}
+            for kind, prefix, size in (("docker", "sha256:", 64), ("eif", "pcr0:", 96))
+            for identity in ("", "none", prefix + "a" * (size - 1), prefix + "a" * (size + 1),
+                             prefix + "g" * size, prefix + "A" * size, prefix + "a" * size + "\n",
+                             " " + prefix + "a" * size, "invalid:" + "a" * size,
+                             "pcr0:sha256:" + "a" * size)
+        ]
+        cases += [
+            {"ARTIFACT_KIND": "eif", "IMAGE_ID": "sha256:" + "a" * 64},
+            {"IMAGE_ID": "pcr0:" + "a" * 96},  # Kind omitted: the Docker default applies.
+            {"ARTIFACT_KIND": "eif", "MODE": "config", "IMAGE_ID": "pcr0:" + "a" * 96},
+            {"ARTIFACT_KIND": "eif", "MODE": "config-plan", "IMAGE_ID": "pcr0:" + "a" * 96},
+            {"ARTIFACT_KIND": "eif", "IMAGE_ID": "pcr0:" + "a" * 96, "ALLOW_KEY_REMOVAL": "true"},
+            {"MODE": "unknown"},
+        ]
+        cases += [{"ARTIFACT_KIND": kind, "MODE": mode}
+                  for kind in ("", "image", "EIF", "unknown", "eif\n")
+                  for mode in ("image", "config", "config-plan")]
+        for values in cases:
+            with self.subTest(values=values):
+                result = self.normalize_parameters(EIF_ENABLED="true", **values)
+                self.assert_exit(result, 1)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+                self.assertFalse((self.root / "external-calls").exists())
+
+    def test_eif_is_dormant_until_explicitly_enabled(self):
+        for value in ("", "false", "1", "TRUE", "true\n"):
+            with self.subTest(value=value):
+                result = self.normalize_parameters(ARTIFACT_KIND="eif", IMAGE_ID="pcr0:" + "a" * 96,
+                                                   EIF_ENABLED=value)
+                self.assert_exit(result, 1)
+                self.assertIn("SSM_DEPLOY_EIF_ENABLED=true", result.stderr)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+                # Existing image callers do not depend on the opt-in variable.
+                self.assert_exit(self.run_step("resolve", "Validate artifact identity", EIF_ENABLED=value), 0)
+
+    def test_source_and_manifest_validation_remain_strict(self):
+        for kind, identity in (("docker", "sha256:" + "a" * 64), ("eif", "pcr0:" + "a" * 96)):
+            for field, size in (("MANIFEST_SHA256", 64), ("SOURCE_SHA", 40)):
+                for value in ("", "none", "a" * (size - 1), "a" * (size + 1), "g" * size,
+                              "A" * size, "a" * size + "\n"):
+                    with self.subTest(kind=kind, field=field, value=value):
+                        self.assert_exit(self.normalize_parameters(
+                            ARTIFACT_KIND=kind, IMAGE_ID=identity, EIF_ENABLED="true", **{field: value}), 1)
+                        self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_ci_gate_queries_exact_source_and_dispatches_once(self):
+        self.tool("gh", '''
+printf '%s\\n' "$*" >> "$STATE/gh-calls"
+case "$1" in
+  api)
+    [[ "$2" == "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" ]]
+    index=$(jq -r '. // 0' "$STATE/ci-index" 2>/dev/null || echo 0)
+    printf '%s\\n' "$((index + 1))" > "$STATE/ci-index"
+    case "$index" in
+      0|1) echo '{"workflow_runs":[]}' ;;
+      2) echo '{"workflow_runs":[{"status":"in_progress","conclusion":null}]}' ;;
+      3) echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}' ;;
+      *) exit 99 ;;
+    esac
+    ;;
+  workflow) [[ "$*" == "workflow run $CI_WORKFLOW --ref $REF --repo $REPO" ]] ;;
+  *) exit 99 ;;
+esac
+''')
+        self.tool("sleep", '[[ "$1" == 30 ]]')
+        gate = step("ci-gate", "Wait for CI on the image commit")
+        result = self.run_step("ci-gate", "Wait for CI on the image commit",
+                               SHA="d" * 40, CI_WORKFLOW="ci.yml", DECISION_JQ=gate["env"]["DECISION_JQ"])
+        self.assert_exit(result, 0)
+        calls = (self.root / "gh-calls").read_text().splitlines()
+        self.assertEqual(calls.count(f"api repos/example/repo/actions/workflows/ci.yml/runs?head_sha={'d' * 40}&per_page=20"), 4)
+        self.assertEqual(calls.count("workflow run ci.yml --ref releases/staging --repo example/repo"), 1)
+
+    def test_send_command_preserves_parameters_and_delivery_timeout(self):
+        self.tool("aws", '''
+[[ "$1 $2" == 'ssm send-command' ]]
+printf '%s\\n' "$@" > "$STATE/aws-args"
+echo '00000000-0000-0000-0000-000000000000'
+''')
+        self.assert_exit(self.normalize_parameters(ARTIFACT_KIND="eif", IMAGE_ID="pcr0:" + "a" * 96,
+                                                  EIF_ENABLED="true"), 0)
+        self.assert_exit(self.run_step("deploy", "Send SSM command", DOCUMENT="test-document",
+                                       INSTANCE_ID="i-test", LOG_GROUP="test-logs"), 0)
+        args = (self.root / "aws-args").read_text().splitlines()
+        self.assertEqual(args[args.index("--timeout-seconds") + 1], "600")
+        self.assertEqual(args[args.index("--parameters") + 1], f"file://{self.root}/ssm-parameters.json")
 
     def test_config_plan_skips_deployment_records(self):
         self.assertEqual(step("deploy", "Create GitHub deployment").get("if"),

@@ -6,6 +6,10 @@ on:
       mode:
         type: string
         required: true
+      artifact-kind:
+        description: Artifact identity kind (docker or eif); EIF requires SSM_DEPLOY_EIF_ENABLED=true.
+        type: string
+        default: docker
       artifact-key:
         type: string
         required: true
@@ -61,6 +65,50 @@ jobs:
       follow-timeout-minutes: ${{ steps.timeouts.outputs.follow-timeout-minutes }}
       deploy-timeout-minutes: ${{ steps.timeouts.outputs.deploy-timeout-minutes }}
     steps:
+      - name: Validate artifact identity
+        env:
+          MODE: ${{ inputs.mode }}
+          ARTIFACT_KIND: ${{ inputs.artifact-kind }}
+          IMAGE_ID: ${{ inputs.image-id }}
+          ALLOW_KEY_REMOVAL: ${{ inputs.allow-key-removal }}
+          EIF_ENABLED: ${{ vars.SSM_DEPLOY_EIF_ENABLED }}
+        run: |
+          set -euo pipefail
+          # Reject incompatible identities before checkout, CI dispatch or AWS access.
+          case "$ARTIFACT_KIND" in
+            docker|eif) ;;
+            *) echo 'artifact-kind must be docker or eif' >&2; exit 1 ;;
+          esac
+          case "$MODE" in
+            image)
+              if [[ "$ARTIFACT_KIND" == docker ]]; then
+                identity_pattern='^sha256:[a-f0-9]{64}$'
+              else
+                identity_pattern='^pcr0:[a-f0-9]{96}$'
+              fi
+              if [[ ! "$IMAGE_ID" =~ $identity_pattern ]]; then
+                echo 'image-id must match artifact-kind (docker: sha256:<64 lowercase hex>; eif: pcr0:<96 lowercase hex>)' >&2
+                exit 1
+              fi
+              ;;
+            config|config-plan)
+              if [[ "$ARTIFACT_KIND" != docker ]]; then
+                echo 'config and config-plan require artifact-kind=docker' >&2
+                exit 1
+              fi
+              ;;
+            *) echo 'Invalid mode' >&2; exit 1 ;;
+          esac
+          if [[ "$ARTIFACT_KIND" == eif ]]; then
+            if [[ "$ALLOW_KEY_REMOVAL" != false ]]; then
+              echo 'EIF deploy requires allow-key-removal=false' >&2
+              exit 1
+            fi
+            if [[ "$EIF_ENABLED" != true ]]; then
+              echo 'EIF deploy is disabled; operators must set caller repository variable SSM_DEPLOY_EIF_ENABLED=true after staging prerequisites are complete' >&2
+              exit 1
+            fi
+          fi
       - name: Patch hosted action runtime
         if: runner.environment == 'github-hosted'
         uses: zkp2p/.github/actions/patch-node24@4ef0030bb0aca98a6c4a6378dbf48ad159ff25d4 # reviewed runtime patch
@@ -237,10 +285,10 @@ jobs:
                   exit 1
                 fi
               done
+              # The resolve job already validated IMAGE_ID against artifact-kind.
               if [[ ! "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ||
-                    ! "$IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ||
                     ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-                echo 'Invalid MANIFEST_SHA256, IMAGE_ID or SOURCE_SHA' >&2
+                echo 'Invalid MANIFEST_SHA256 or SOURCE_SHA' >&2
                 exit 1
               fi
               ;;

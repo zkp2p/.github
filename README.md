@@ -186,11 +186,12 @@ the final success gate depends only on log polling and deployment-status recordi
 | Input | Contract |
 | --- | --- |
 | `mode` | Required: `image`, `config` or `config-plan`. |
+| `artifact-kind` | Optional string, default `docker`; accepts `docker` or `eif`. Config modes require `docker`. EIF requires the caller repository variable `SSM_DEPLOY_EIF_ENABLED` to equal `true`. |
 | `artifact-key` | Required string; S3 artifact key in image mode. |
 | `manifest-sha256` | Required string; 64 lowercase hex characters in image mode. |
-| `image-id` | Required string; `sha256:` followed by 64 lowercase hex characters in image mode. |
-| `source-sha` | Required string; full lowercase commit SHA of the image, supplied as `github.sha`. |
-| `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. |
+| `image-id` | Required string; in image mode, `sha256:` followed by 64 lowercase hex characters for Docker, or `pcr0:` followed by 96 lowercase hex characters for EIF. |
+| `source-sha` | Required string; full lowercase commit SHA of the artifact, supplied as `github.sha`. |
+| `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. EIF requires `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
 | `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `6600` inclusive. Maximum time to follow the host command, in seconds. |
@@ -216,6 +217,66 @@ force **all four**, including `source-sha`, to `none` before sending the command
 regardless of caller values. GitHub deployment records and notification metadata
 still identify the caller commit. `config-plan` delegates the dry run to the host
 document; `allow-key-removal` is enforced by the host bridge.
+
+### EIF artifacts (dormant by default)
+
+Existing callers omit `artifact-kind` and keep the Docker identity contract and
+the same SSM parameter JSON. Kind and identity are validated before checkout,
+CI dispatch, role assumption or deployment records. Unknown kinds, mixed identity
+prefixes, uppercase/nonhex/wrong-length digests, and EIF with either config mode
+fail closed. The manifest digest and source SHA retain their strict lowercase
+64- and 40-character validation.
+
+EIF calls fail with an explicit disabled message unless an operator sets the
+**caller repository** variable `SSM_DEPLOY_EIF_ENABLED` to exactly `true`. Leave it
+unset until staging prerequisites, trusted host bridge adoption, IAM roles and
+the EIF-specific SSM document are ready. Clearing the variable disables future
+EIF calls; it does not cancel a command already running. Docker callers do not
+depend on this variable. This reusable workflow has only `workflow_call`, adds
+no release trigger, and performs no signing.
+
+The attestation caller must use a staging-only environment map, `ci: required`,
+the approved fleet runner with no hosted fallback, and a reviewed full commit
+pin for this workflow. After the EIF build job publishes its outputs, its deploy
+job supplies:
+
+```yaml
+with:
+  mode: image
+  artifact-kind: eif
+  artifact-key: ${{ needs.eif.outputs.artifact-key }}
+  manifest-sha256: ${{ needs.eif.outputs.manifest-sha256 }}
+  image-id: ${{ needs.eif.outputs.image-id }} # pcr0:<96 lowercase hex>
+  source-sha: ${{ github.sha }}
+  allow-key-removal: false
+  host-timeout-seconds: 2400
+  runner: ${{ vars.CI_RUNNER }}
+```
+
+The final artifact key is
+`zkp2p/attestation-service/<runId>/<runAttempt>/attestation-eif.tar.gz`. It contains
+only `app.eif`, `receipt.json`, `vsock-routes.json` and `SHA256SUMS`.
+`manifest-sha256` hashes the exact sorted `SHA256SUMS` bytes, with two-space
+separators and no self-hash; it is not the hash of `receipt.json` or the EIF.
+Ciphertext build inputs stay in the build workflow and never pass through this
+deploy interface.
+
+SSM still receives `Mode=image` and `ImageId=pcr0:<PCR0>`. There is **no new
+`ArtifactKind` SSM parameter**: the selected document's fixed settings and identity
+pattern establish EIF behavior. The host verifies the artifact, signature and
+measurements. `RunId` and `RunAttempt` retain their existing meaning. The 2400-second
+follow duration covers the document's 1800-second execution timeout plus up to
+600 seconds delivery; SendCommand's delivery timeout remains 600 seconds.
+
+The caller must subsequently verify the serving v2 receipt at
+`deployed/attestation-service/attestation-staging.json` and the exact v1 attempt
+receipt at `attempts/attestation-service/attestation-staging/<runId>-<runAttempt>.json`.
+Acceptance requires matching run/attempt and artifact identity, `applied` or `noop`,
+and successful loopback/public verification. Shared SSM success and its deployment
+card alone do not establish this receipt contract. Receipt verification is owned
+by the attestation/peer-infra caller integration.
+
+### CI and command following
 
 For image deploys with `ci: required`, the workflow polls CI for the image commit
 every 30 seconds for up to 45 minutes. A completed success passes; otherwise any
@@ -262,6 +323,9 @@ The test extracts the workflow's `decide.env.DECISION_JQ` with
 only, and empty results. The shell step harness checks host timeout validation and
 rounding, yq selection, log pagination and deduplication, polling failures/timeouts,
 Slack failures, and the final success gate with isolated fake external commands.
+It also checks Docker/EIF identity validation, dormant EIF gating, unchanged SSM
+parameters and config normalization, run/attempt forwarding, delivery timeout,
+and exact-SHA CI polling with a single dispatch through a fake `gh` command.
 These checks do not exercise a live deployment or call AWS/GitHub APIs.
 
 The public build harness checks the event guard, fixed hosted runner, caller
