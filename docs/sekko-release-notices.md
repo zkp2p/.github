@@ -20,8 +20,13 @@ not reuse the scope-signing key or put a key in repository variables/config.
 needs no checkout, no extra `contents` permission, no private Sekko import or
 checkout, no new cross-repository token and no `secrets: inherit`. The runner
 needs Python 3 and GNU `timeout` in addition to the existing deploy tools.
-Publish the reviewed helper commit before adopting a reusable-workflow revision
-that references it; an unpublished local pin cannot be downloaded by Actions.
+Before any caller adoption, the final reviewed helper commit must be reachable
+on this repository's `main`, and the reusable workflow must be repinned to that
+exact immutable helper SHA. Verify both against `main` after the authorized
+merge; publishing a feature branch or draft PR is insufficient. If merging
+rewrites the helper commit, repin and review the resulting workflow commit before
+adoption. Main reachability and the final repin remain activation gates until
+merge is authorized and complete; this draft does not fulfill those gates.
 
 The exact config fields are:
 
@@ -73,16 +78,22 @@ commit at that moment; it does not prove full payment-flow health.
 
 The payload is the consumer's release-v1 contract: event, scope, target,
 surface, staging environment, origin, exact source SHA, integer release/expiry
-times (one-hour TTL), `availability: available`, description, and
+times, `availability: available`, description, and
 `change_type: release`. Event identity is
 `pay:staging:<run_id>:<run_attempt>:<source-sha>`. The sender signs
 `b'release-v1\x00' + canonical(payload)` using HMAC-SHA256 and emits exactly
 `key_id`, `purpose`, `payload`, `signature`. Canonical JSON is ASCII-escaped,
 sorted, compact and rejects non-finite numbers, matching Sekko's contract.
 
+The sender backdates `released_at` by an explicit five-second clock-skew
+allowance: `floor(sender_now) - 5`. Expiry is that backdated release time plus
+3600 seconds, so the allowance does not extend the one-hour TTL. This permits
+a receiver one to five seconds behind the sender to accept the timestamp; a
+larger skew may still fail. Consumer timestamp/scope validation is unchanged.
+
 The envelope bytes and timestamps are constructed once per invocation. Up to
 three POST attempts reuse those exact bytes, with 2s and 4s delays. Only
-transport failures and HTTP 408/429/503 retry. HTTP 202 with `status: queued`
+transport failures and HTTP 408/429/502/503/504 retry. HTTP 202 with `status: queued`
 or HTTP 200 with `status: duplicate` succeeds. Redirects, other 4xx/5xx, malformed
 acknowledgements, wrong acknowledgement statuses, or exhausted retries leave
 a delivery gap. Each request has a 10s socket timeout and bounded response;
@@ -132,8 +143,9 @@ expired reconciliation or authority to run a campaign.
 
 ## Future Pay caller change (proposal only)
 
-After publishing/reviewing this helper and reusable workflow and preparing an
-approved config/key, change **only** `jobs.pay-api` in Pay's
+Only after the final helper pin is reachable on `main`, the reusable workflow
+is repinned/reviewed against it, and an approved config/key exists, change
+**only** `jobs.pay-api` in Pay's
 `.github/workflows/deploy.yml`. Leave `jobs.support` at its existing pin and
 without notice inputs/secrets. Retain every existing Pay input/permission.
 Replace the Pay API workflow pin with the full reviewed workflow commit and add:
@@ -151,7 +163,8 @@ jobs:
 ```
 
 Keep `SEKKO_RELEASE_NOTICES_ENABLED` unset/false until the approved configuration
-and key registration exist and are reviewed. Clearing it disables future
+and key registration exist and are reviewed, and the final helper-main/pin gates
+above have been verified after an authorized merge. Clearing it disables future
 notices. It does not cancel an invocation already running. The source SHA
 must continue to come from `needs.pay-api-image.outputs.source-sha`.
 
@@ -180,7 +193,8 @@ actionlint .github/workflows/ssm-deploy.yml \
 
 The notice harness uses only local fixtures and injected transports, including
 canonical signing, opt-out and every eligibility/config gate, mismatched
-readiness/SHA, transport and HTTP retry classes, duplicate acknowledgement,
+readiness/SHA, the five-second timestamp/signature fixture, transport and HTTP
+retry classes (including 502/504), duplicate acknowledgement,
 redirect rejection, constant retry bytes, bounded response reads, verified TLS,
 lost acknowledgements, unsigned-payload persistence before signing, stale cleanup,
 and safe gap evidence. No live inbox/readiness/deployment/provider/model is

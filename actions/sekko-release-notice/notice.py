@@ -17,9 +17,10 @@ from urllib.parse import urlsplit
 MAX_BYTES = 65_536
 STAGING_ORIGIN = "https://api-staging.pay.peer.xyz"
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-RETRYABLE = {408, 429, 503}
+RETRYABLE = {408, 429, 502, 503, 504}
 ATTEMPTS = 3
 TIMEOUT = 10
+RELEASE_CLOCK_SKEW_SECONDS = 5
 
 
 class NoticeError(ValueError):
@@ -153,7 +154,8 @@ def execute(env, *, persist_payload, transport=request, now=time.time, sleep=tim
                 raise NoticeError("readiness_failed")
         except (ValueError, KeyError, TypeError):
             raise NoticeError("readiness_failed") from None
-        released = int(now())
+        # Absorb only a small sender-ahead clock skew; never relax consumer checks.
+        released = int(now()) - RELEASE_CLOCK_SKEW_SECONDS
         payload = {name: config[name] for name in ("scope_id", "target_id", "surface", "origin", "description")}
         payload.update(event_id=event, environment="staging", version=sha,
                        released_at=released, expires_at=released + 3600,

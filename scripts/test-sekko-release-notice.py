@@ -36,7 +36,7 @@ READY = {"success": True, "statusCode": 200, "responseObject": {"ok": True, "com
 
 
 class NoticeTests(unittest.TestCase):
-    def send(self, *, env=None, readiness=None, replies=None):
+    def send(self, *, env=None, readiness=None, replies=None, sender_now=1000):
         self.calls, self.sleeps, self.clocks, self.payloads = [], [], [], []
         replies = list(replies or [(202, b'{"status":"queued"}')])
 
@@ -49,7 +49,7 @@ class NoticeTests(unittest.TestCase):
 
         def now():
             self.clocks.append(True)
-            return 1000
+            return sender_now
 
         return notice.execute(env or ENV, persist_payload=self.payloads.append,
                               transport=transport, now=now, sleep=self.sleeps.append)
@@ -102,8 +102,8 @@ class NoticeTests(unittest.TestCase):
         envelope = json.loads(body)
         payload = {"event_id": f"pay:staging:41051883943:2:{SHA}", "scope_id": "reviewed-scope",
                    "target_id": "pay-api-staging", "surface": "pay-api", "environment": "staging",
-                   "origin": notice.STAGING_ORIGIN, "version": SHA, "released_at": 1000,
-                   "expires_at": 4600, "availability": "available", "description": "Staging release \u00e9",
+                   "origin": notice.STAGING_ORIGIN, "version": SHA, "released_at": 995,
+                   "expires_at": 4595, "availability": "available", "description": "Staging release \u00e9",
                    "change_type": "release"}
         # Keep this independent from the production serializer and signing function.
         canonical_payload = json.dumps(payload, ensure_ascii=True, allow_nan=False, sort_keys=True,
@@ -118,6 +118,21 @@ class NoticeTests(unittest.TestCase):
         self.assertLessEqual(len(payload["event_id"]), 128)
         self.assertLessEqual(payload["expires_at"] - payload["released_at"], 86400)
         self.assertEqual(self.clocks, [True])
+
+    def test_five_second_backdate_is_frozen_and_ttl_is_measured_from_release(self):
+        self.assertEqual(self.send(sender_now=1000.9, replies=[(502, b"gateway"),
+                             (504, b"gateway timeout"), (202, b'{"status":"queued"}')])["status"], "delivered")
+        envelopes = [json.loads(body) for method, _, body in self.calls if method == "POST"]
+        payload = envelopes[0]["payload"]
+        self.assertEqual((payload["released_at"], payload["expires_at"]), (995, 4595))
+        self.assertEqual(payload["expires_at"] - payload["released_at"], 3600)
+        self.assertEqual(len(self.clocks), 1)
+        self.assertEqual(self.payloads, [notice.canonical(payload)])
+        # Independently reproduce the signature for the backdated fixture.
+        expected = hmac.new(bytes.fromhex(KEY), b"release-v1\x00" + json.dumps(payload,
+                            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                            allow_nan=False).encode("ascii"), hashlib.sha256).hexdigest()
+        self.assertEqual({envelope["signature"] for envelope in envelopes}, {expected})
 
     def test_every_readiness_assertion_and_oversize_or_malformed_body_blocks_signing(self):
         fixtures = [(code, json.dumps(READY).encode()) for code in (301, 302, 307, 503)]
@@ -141,7 +156,7 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_bounded_retry_uses_identical_bytes_and_duplicate_is_success(self):
-        for transient in (408, 429, 503, OSError("sensitive transport text"), http.client.HTTPException("private")):
+        for transient in (408, 429, 502, 503, 504, OSError("sensitive transport text"), http.client.HTTPException("private")):
             with self.subTest(transient=type(transient)):
                 reply = transient if isinstance(transient, Exception) else (transient, b"private response")
                 result = self.send(replies=[reply, reply, (200, b'{"status":"duplicate"}')])
@@ -149,8 +164,12 @@ class NoticeTests(unittest.TestCase):
                 self.assertEqual(self.sleeps, [2, 4])
                 self.assertEqual(self.clocks, [True])
                 self.assertEqual(len({body for method, _, body in self.calls if method == "POST"}), 1)
-        result = self.send(replies=[(503, b"private")] * 3)
-        self.assertEqual((result["reason"], result["attempts"]), ("delivery_exhausted", 3))
+        for status in (408, 429, 502, 503, 504):
+            with self.subTest(exhausted_status=status):
+                result = self.send(replies=[(status, b"private")] * 3)
+                self.assertEqual((result["reason"], result["attempts"]), ("delivery_exhausted", 3))
+                self.assertEqual(self.sleeps, [2, 4])
+                self.assertEqual(len({body for method, _, body in self.calls if method == "POST"}), 1)
 
     def test_lost_ack_preserves_exact_unsigned_payload_before_signing_and_retries(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -248,7 +267,7 @@ class NoticeTests(unittest.TestCase):
                 self.assertEqual(other.read_text(), "preserve other work")
 
     def test_redirects_contract_errors_and_other_server_errors_do_not_retry(self):
-        for status in (300, 301, 302, 303, 307, 308, 400, 401, 403, 404, 409, 413, 422, 500, 502, 504):
+        for status in (300, 301, 302, 303, 307, 308, 400, 401, 403, 404, 409, 413, 422, 500):
             with self.subTest(status=status):
                 result = self.send(replies=[(status, b"sensitive response")])
                 self.assertEqual((result["reason"], result["attempts"]), ("delivery_rejected", 1))
