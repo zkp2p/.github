@@ -14,6 +14,8 @@ runs:
         NOTICE_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
+        # Clear only this task's stale pending payload, including on startup failure.
+        rm -f -- "$RUNNER_TEMP/sekko-release-notice-pending.json"
         # The report is written before network I/O, including on later interruption.
         # Keep the key in SEKKO_RELEASE_KEY; never put it in arguments or files.
         timeout --signal=TERM --kill-after=5s 100s python3 -I "$NOTICE_ACTION_PATH/notice.py"

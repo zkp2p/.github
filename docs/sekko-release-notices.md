@@ -91,21 +91,44 @@ workflow step cap. There is one readiness GET and no readiness retry.
 
 Notice steps use `continue-on-error` and do not rewrite the GitHub deployment
 result, rerun SSM, roll back, or change the final deployment success gate. The
-step summary explicitly reports a delivery gap, and the failed-delivery
-artifact contains fixed reason codes, attempts, HTTP status and safe event /
-command / deployment references only. Its retention is seven days. The report
-is initialized before network I/O, so interrupted deliveries retain an
-`interrupted` report when the process began; a workflow fallback summary also
-covers helper startup failure. No key, config, body, envelope, signature or
-external exception text is logged or uploaded. Cancellation/runner loss can
-still prevent artifact upload; a successful deployment is never evidence that
-a notice arrived. Inspect the notice step/report and consumer acknowledgement.
+step summary explicitly reports a delivery gap. Two separate failed-delivery
+artifacts are retained for seven days when present:
 
-Do not rerun a deployment to resend a notice. In-process retries are the only
-resend mechanism here. Preserve any delivery gap for a separate reviewed
-notice-only recovery; this patch provides no automatic replay job or durable
-envelope store. A fresh invocation must not reuse an accepted event ID with
-new timestamps/signature, because Sekko rejects event-ID collisions.
+- `sekko-release-notice-gap-<run>-<attempt>` contains the safe report: fixed reason
+  codes, attempts, HTTP status and safe event / command / deployment references.
+- `sekko-release-payload-pending-<run>-<attempt>` contains only the exact canonical
+  **unsigned public payload** saved before the first signing/send. Its source
+  JSON file is created exclusively with mode `0600`. It contains no inbox URL,
+  configuration document, key, signature or signed envelope.
+
+Before every invocation, only this task's exact stale pending filename is
+removed. Invalid config, a failed readiness check, or failed persistence cannot
+leave a previous payload available for upload. Failure to save the payload
+prevents signing and sending. The safe report is initialized before network
+I/O, so interrupted deliveries retain an `interrupted` report when the process
+began; a workflow fallback summary also covers helper startup failure. No key,
+config, response body, envelope, signature or external exception text is logged
+or uploaded. Cancellation/runner loss can still prevent artifact upload; a
+successful deployment is never evidence that a notice arrived. Inspect the
+notice step/report and consumer acknowledgement.
+
+Do not rerun a deployment to resend a notice. For a separate reviewed
+notice-only recovery **within the original expiry**, retrieve the unsigned
+pending payload, set its downloaded file mode to `0600`, and re-sign that identical
+payload using the registered release
+key and the same `release-v1` canonicalization. Keep every field, event ID and
+release/expiry timestamp unchanged. Deterministic HMAC reproduces the same
+signature with the same key. A lost acknowledgement may mean the inbox already
+accepted it; resending the same payload can return `duplicate`. Do not substitute
+current config fields or regenerate a payload from the current clock.
+
+Before any **expired** reconciliation, inspect the inbox/event dedupe record to
+determine whether the original event was accepted or queued. Do not extend the
+expired payload or reuse its event ID with fresh timestamps; Sekko rejects
+collisions. Any new notice requires a separately reviewed recovery decision,
+current scope/availability proof and a distinct event identity. This patch
+provides the recovery payload and evidence only, with no replay job, automatic
+expired reconciliation or authority to run a campaign.
 
 ## Future Pay caller change (proposal only)
 
@@ -132,7 +155,17 @@ and key registration exist and are reviewed. Clearing it disables future
 notices. It does not cancel an invocation already running. The source SHA
 must continue to come from `needs.pay-api-image.outputs.source-sha`.
 
-## Local verification
+## CI and local verification
+
+The PR-native `Sekko release notice checks` workflow, job `Native notice and
+deploy gates`, runs these checks on a fixed Ubuntu 24.04 runner with read-only
+`contents`, pinned checkout and no deploy/publish steps or supplied credentials:
+notice tests, the actual existing Docker/yq deploy harness, and actionlint 1.7.12
+from its versioned official release archive verified against a fixed SHA-256.
+It does not replace the Docker/yq bootstrap with a parser shim. The actionlint
+Linux x64 digest is `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`.
+No native CI result is claimed until that PR check has actually run.
+
 
 ```bash
 python3 scripts/test-sekko-release-notice.py
@@ -144,6 +177,7 @@ The notice harness uses only local fixtures and injected transports, including
 canonical signing, opt-out and every eligibility/config gate, mismatched
 readiness/SHA, transport and HTTP retry classes, duplicate acknowledgement,
 redirect rejection, constant retry bytes, bounded response reads, verified TLS
+lost acknowledgements, unsigned-payload persistence before signing, stale cleanup,
 and safe gap evidence. No live inbox/readiness/deployment/provider/model is
 called. The existing deploy harness additionally requires Docker and its
 pinned yq image; missing tools are verification gaps, not live-test permission.

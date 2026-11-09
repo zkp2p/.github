@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Local fixture/injected transport tests only; no sockets or external services."""
 
+import contextlib
 import hashlib
+import io
 import hmac
 import http.client
 import importlib.util
@@ -35,7 +37,7 @@ READY = {"success": True, "statusCode": 200, "responseObject": {"ok": True, "com
 
 class NoticeTests(unittest.TestCase):
     def send(self, *, env=None, readiness=None, replies=None):
-        self.calls, self.sleeps, self.clocks = [], [], []
+        self.calls, self.sleeps, self.clocks, self.payloads = [], [], [], []
         replies = list(replies or [(202, b'{"status":"queued"}')])
 
         def transport(method, url, body=None):
@@ -49,7 +51,8 @@ class NoticeTests(unittest.TestCase):
             self.clocks.append(True)
             return 1000
 
-        return notice.execute(env or ENV, transport=transport, now=now, sleep=self.sleeps.append)
+        return notice.execute(env or ENV, persist_payload=self.payloads.append,
+                              transport=transport, now=now, sleep=self.sleeps.append)
 
     def test_disabled_and_every_context_gate_make_no_requests(self):
         for name, value in {"SEKKO_NOTICE_ENABLED": "false", "NOTICE_REPOSITORY": "zkp2p/other",
@@ -59,7 +62,8 @@ class NoticeTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(self.send(env={**ENV, name: value})["status"], "skipped")
                 self.assertEqual(self.calls, [])
-        self.assertEqual(notice.execute({}, transport=lambda *_: self.fail("network"))["status"], "skipped")
+        self.assertEqual(notice.execute({}, persist_payload=lambda *_: self.fail("persist"),
+                                        transport=lambda *_: self.fail("network"))["status"], "skipped")
 
     def test_missing_config_or_key_and_invalid_context_never_probe_or_post(self):
         for name, value in (("SEKKO_NOTICE_CONFIG", ""), ("SEKKO_RELEASE_KEY", ""),
@@ -107,6 +111,7 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual(envelope, {"key_id": "release-ci", "purpose": "release-v1", "payload": payload,
                                    "signature": hmac.new(bytes.fromhex(KEY), b"release-v1\x00" + canonical_payload,
                                                          hashlib.sha256).hexdigest()})
+        self.assertEqual(self.payloads, [canonical_payload])
         self.assertEqual(body, json.dumps(envelope, ensure_ascii=True, allow_nan=False, sort_keys=True,
                                         separators=(",", ":")).encode("ascii"))
         self.assertIn(b"\\u00e9", body)
@@ -146,6 +151,101 @@ class NoticeTests(unittest.TestCase):
                 self.assertEqual(len({body for method, _, body in self.calls if method == "POST"}), 1)
         result = self.send(replies=[(503, b"private")] * 3)
         self.assertEqual((result["reason"], result["attempts"]), ("delivery_exhausted", 3))
+
+    def test_lost_ack_preserves_exact_unsigned_payload_before_signing_and_retries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pending = Path(temp, "sekko-release-notice-pending.json")
+            accepted = []
+            ordering = []
+            real_hmac = notice.hmac.new
+
+            def persist(raw):
+                ordering.append("persist")
+                notice.write_pending(pending, raw)
+
+            def sign(*args):
+                ordering.append("sign")
+                self.assertTrue(pending.exists())
+                self.assertEqual(args[1], b"release-v1\x00" + pending.read_bytes())
+                return real_hmac(*args)
+
+            def transport(method, url, body=None):
+                if method == "GET":
+                    return 200, json.dumps(READY).encode()
+                ordering.append("post")
+                envelope = json.loads(body)
+                self.assertEqual(pending.read_bytes(), notice.canonical(envelope["payload"]))
+                self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(set(json.loads(pending.read_bytes())) & {"key_id", "purpose", "signature", "payload", "inbox_url"})
+                if not accepted:
+                    accepted.append(body)
+                    raise TimeoutError("ACK lost after inbox accepted the release")
+                self.assertEqual(body, accepted[0])
+                return 200, b'{"status":"duplicate"}'
+
+            with patch.object(notice.hmac, "new", side_effect=sign):
+                result = notice.execute(ENV, persist_payload=persist, transport=transport,
+                                        now=lambda: 1000, sleep=lambda _: None)
+            self.assertEqual((result["status"], result["reason"], result["attempts"]), ("delivered", "duplicate", 2))
+            self.assertEqual(ordering, ["persist", "sign", "post", "post"])
+            self.assertEqual(json.loads(pending.read_bytes()), json.loads(accepted[0])["payload"])
+            self.assertNotIn(KEY.encode(), pending.read_bytes())
+
+    def test_failed_payload_persistence_never_signs_or_posts(self):
+        calls = []
+
+        def transport(method, url, body=None):
+            calls.append(method)
+            return 200, json.dumps(READY).encode()
+
+        def persist(_):
+            raise OSError("private filesystem text")
+
+        with patch.object(notice.hmac, "new", side_effect=AssertionError("must not sign")):
+            result = notice.execute(ENV, persist_payload=persist, transport=transport, now=lambda: 1000)
+        self.assertEqual(result["reason"], "pending_payload_failed")
+        self.assertEqual(calls, ["GET"])
+
+    def test_failed_delivery_keeps_payload_and_safe_report_as_separate_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pending = Path(temp, "sekko-release-notice-pending.json")
+            attempts = []
+            env = {**ENV, "RUNNER_TEMP": temp, "GITHUB_OUTPUT": temp + "/output", "GITHUB_STEP_SUMMARY": temp + "/summary"}
+
+            def transport(method, url, body=None):
+                if method == "GET":
+                    return 200, json.dumps(READY).encode()
+                attempts.append(body)
+                raise TimeoutError("lost ACK")
+
+            with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(notice.main(transport=transport, now=lambda: 1000, sleep=lambda _: None), 1)
+            report_raw = Path(temp, "sekko-release-notice-report.json").read_bytes()
+            report = json.loads(report_raw)
+            self.assertEqual(report["reason"], "delivery_exhausted")
+            self.assertEqual(report["deployment_outcome"], "success")
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(len(set(attempts)), 1)
+            self.assertEqual(pending.read_bytes(), notice.canonical(json.loads(attempts[0])["payload"]))
+            self.assertNotIn(b"description", report_raw)
+            self.assertNotIn(b"signature", report_raw + pending.read_bytes())
+            self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_config_clears_only_exact_stale_pending_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pending = Path(temp, "sekko-release-notice-pending.json")
+            other = Path(temp, "another-notice-pending.json")
+            other.write_text("preserve other work")
+            env = {**ENV, "SEKKO_NOTICE_CONFIG": "invalid", "RUNNER_TEMP": temp,
+                   "GITHUB_OUTPUT": temp + "/output", "GITHUB_STEP_SUMMARY": temp + "/summary"}
+            for disabled in (False, True):
+                pending.write_text("stale old public payload")
+                env["SEKKO_NOTICE_ENABLED"] = "false" if disabled else "true"
+                with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+                    result = notice.main(transport=lambda *_: self.fail("no network"))
+                self.assertEqual(result, 0 if disabled else 1)
+                self.assertFalse(pending.exists())
+                self.assertEqual(other.read_text(), "preserve other work")
 
     def test_redirects_contract_errors_and_other_server_errors_do_not_retry(self):
         for status in (300, 301, 302, 303, 307, 308, 400, 401, 403, 404, 409, 413, 422, 500, 502, 504):

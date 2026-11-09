@@ -128,7 +128,7 @@ def eligible(env):
     }.items())
 
 
-def execute(env, *, transport=request, now=time.time, sleep=time.sleep):
+def execute(env, *, persist_payload, transport=request, now=time.time, sleep=time.sleep):
     report = {"status": "skipped", "reason": "not_eligible", "attempts": 0}
     if not eligible(env):
         return report
@@ -158,7 +158,12 @@ def execute(env, *, transport=request, now=time.time, sleep=time.sleep):
         payload.update(event_id=event, environment="staging", version=sha,
                        released_at=released, expires_at=released + 3600,
                        availability="available", change_type="release")
-        signature = hmac.new(key, b"release-v1\x00" + canonical(payload), hashlib.sha256).hexdigest()
+        payload_bytes = canonical(payload)
+        try:
+            persist_payload(payload_bytes)
+        except OSError:
+            raise NoticeError("pending_payload_failed") from None
+        signature = hmac.new(key, b"release-v1\x00" + payload_bytes, hashlib.sha256).hexdigest()
         body = canonical({"key_id": "release-ci", "purpose": "release-v1",
                           "payload": payload, "signature": signature})
         # Freeze these bytes once: retries must not change timestamp, ID or signature.
@@ -187,13 +192,26 @@ def execute(env, *, transport=request, now=time.time, sleep=time.sleep):
     return report
 
 
-def main():
+def write_pending(path, raw):
+    # Exclusive creation prevents a stale symlink/race from redirecting this write.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def main(*, transport=request, now=time.time, sleep=time.sleep):
+    pending = Path(os.environ["RUNNER_TEMP"]) / "sekko-release-notice-pending.json"
+    # Remove this task's exact stale filename even when the new config is invalid.
+    pending.unlink(missing_ok=True)
     # Evidence contains fixed reason codes and deployment references only: no config,
     # response body, signed envelope, signature, key, or exception details.
     path = Path(os.environ["RUNNER_TEMP"]) / "sekko-release-notice-report.json"
     path.write_bytes(canonical({"status": "failed", "reason": "interrupted", "attempts": 0}) + b"\n")
     path.chmod(0o600)
-    report = execute(os.environ)
+    report = execute(os.environ, persist_payload=lambda raw: write_pending(pending, raw),
+                     transport=transport, now=now, sleep=sleep)
     path.write_bytes(canonical(report) + b"\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("status=" + report["status"] + "\n")
@@ -201,7 +219,7 @@ def main():
         if report["status"] == "failed":
             summary.write("Sekko release-notice delivery gap: **" + report["reason"]
                           + "**. Deployment outcome is separate; do not redeploy to resend. "
-                          "See the safe delivery report artifact.\n")
+                          "See the safe report and unsigned pending payload artifacts if present.\n")
         else:
             summary.write("Sekko release notice: " + report["status"] + ".\n")
     if report["status"] == "failed":
