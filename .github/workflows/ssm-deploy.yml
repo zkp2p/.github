@@ -503,7 +503,7 @@ jobs:
           steps.require-deploy.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 2
-        uses: zkp2p/.github/actions/sekko-release-notice@4a3064abcdbf662ef246b4c4c2a03aeb05f538ba # local helper commit; publish before adoption
+        uses: zkp2p/.github/actions/sekko-release-notice@31dc29755140fd21c62836409d56bcc386b92ce3 # final helper must be reachable on main before caller adoption
         env:
           SEKKO_NOTICE_ENABLED: ${{ inputs.sekko-release-notice }}
           SEKKO_NOTICE_CONFIG: ${{ inputs.sekko-notice-config }}
