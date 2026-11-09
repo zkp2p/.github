@@ -200,3 +200,130 @@ lost acknowledgements, unsigned-payload persistence before signing, stale cleanu
 and safe gap evidence. No live inbox/readiness/deployment/provider/model is
 called. The existing deploy harness additionally requires Docker and its
 pinned yq image; missing tools are verification gaps, not live-test permission.
+
+## Inactive S3 publisher library
+
+`actions/sekko-release-notice/publisher.py` adds an inactive standard-library
+adapter for the separately reviewed Sekko release-pull intake. It is not wired
+into the action, reusable workflow, Pay callers, roles or secrets. The action's
+command-line entry point still selects HTTPS only. No CLI is run and no
+credentials are discovered on import or construction. This draft does not
+activate publication or establish that a controller is polling.
+
+The destination is fixed in code:
+
+- Bucket: `zkp2p-sekko-releases-411399509833-us-east-1`
+- Prefix: `notices/v1/pay-api/staging/`
+- Expected owner: `411399509833`; region: `us-east-1`
+- Object key: prefix + lowercase SHA-256 of the ASCII stable event ID + `.json`
+
+The flat hash key contains no timestamp or raw event fields. The signed payload
+still contains the original event identity. No endpoint, bucket, prefix, region,
+profile or role can be selected through a notice or action input.
+
+The library interfaces are:
+
+- `OidcPublicationIdentity(role_arn, token)`: an explicit trusted-construction
+  value containing the exact proposed role ARN
+  `arn:aws:iam::411399509833:role/sekko-release-publisher` and bounded OIDC JWT
+  bytes. Other roles, including the existing deployment role, are rejected.
+  This name is a proposed binding, not evidence that the role exists or is safe.
+  The token is excluded from its representation. Syntax validation is
+  not token verification or evidence of a dedicated IAM policy.
+- `AwsCliPublisher(cli_path, *, expected_version, identity=None,
+  activated=False, qualified=False, runner=None)`: requires an absolute CLI path
+  and exact `2.x.y` version. Both booleans must be explicitly true and a trusted
+  identity must be supplied before any CLI execution is possible. `runner` is a
+  trusted testing seam, never a field in the notice.
+- `publisher(event_id, signed_envelope_bytes)`: consumes the exact frozen bytes,
+  bounded to 65,536 bytes, and returns only `status: published`, `version_id` and
+  the hex `body_sha256`. The event must match the envelope's payload. It does not
+  change, sign or extend the envelope, and does not validate the consumer's scope.
+- `notice.execute(..., publisher=None)` and `notice.main(..., publisher=None)`:
+  trusted Python injection only. `None` retains the existing HTTPS contract and
+  retries. Supplying a publisher requires the existing config fields **except**
+  `inbox_url`, which must be omitted. Every existing eligibility, configuration,
+  signing-key, public readiness/SHA and unsigned-payload persistence gate still
+  applies before signing or publication.
+
+A future trusted CI wrapper must separately select a **dedicated short-lived
+OIDC publication identity**, then supply it through construction. This adapter
+does not reuse the existing deployment role or fetch an OIDC token. It creates
+a fresh private HOME, empty AWS config/credentials/Boto files and a mode `0600`
+token file from the supplied bytes. Its environment is an allowlist: ambient
+profiles, static keys, container credentials, proxy variables, custom endpoints,
+CA overrides and Python paths are absent; EC2 metadata credentials are disabled.
+The only configured credential provider is explicit web identity for the supplied
+role. Actual issuer/audience/subject/expiry, role trust and least-privilege IAM
+must be qualified independently; the Python constructor cannot prove them.
+
+For each call, the adapter first verifies the qualified CLI's exact version,
+then performs **one** `s3api put-object` with `IfNoneMatch: *`, the fixed expected
+owner, exact content length, JSON content type and the base64 SHA-256 checksum of
+the original envelope bytes, using documented
+[PutObject fields](https://docs.aws.amazon.com/cli/latest/reference/s3api/put-object.html).
+The regional S3 endpoint is fixed and uses CLI
+default TLS verification. AWS retries are disabled (`AWS_MAX_ATTEMPTS=1`), with
+two-second connect/read timeouts and a five-second total limit per subprocess.
+No shell, pager, prompt, Get, List, identity probe or installation is used.
+
+Success requires a nonempty, non-`null`, bounded version ID and a returned
+`ChecksumSHA256` matching the original bytes. An ETag is not checksum proof.
+An explicitly non-full-object checksum is rejected. Conditional errors 409/412,
+timeouts, lost acknowledgements, missing/malformed proof, CLI failures and cleanup
+failures all raise the fixed `PublicationUnknown("publication_unknown")`.
+The adapter neither retries a PUT nor chooses another key. It has no cross-run
+delivery journal: another separately authorized invocation still makes at most
+one conditional PUT and may return unknown. The write-only role has no Get/List
+proof with which to turn an existing object or lost ACK into confirmed success.
+
+The runner captures stdout/stderr through backpressured pipes, with a combined
+131,072-byte bound; stderr is discarded and no raw output is logged. Private
+scratch contains the bounded body, at most 16,384 token bytes and empty config
+files; output is not spooled to disk. While running and on completion, scratch
+is checked for at most 64 entries and 262,144 regular-file bytes; symlinks and
+special files fail closed. The check is sampled at intervals up to 50ms, rather
+than an OS disk quota. Scratch is removed on success and failure.
+Each child starts an owned process group; cleanup signals the group even after
+its leader exits, waits a 200ms grace and kills remaining descendants. After
+SIGKILL it probes for group disappearance for at most one second; an exited
+leader alone is insufficient. Unconfirmed group cleanup produces
+`publication_unknown`, even with valid storage metadata. These
+are lifecycle bounds for a trusted, qualified CLI, not an OS sandbox. Runner
+loss or forced termination can prevent normal scratch cleanup; runner isolation
+and cleanup remain deployment requirements.
+
+On confirmed storage proof, `notice` reports `status: published` and
+`reason: controller_intake_unconfirmed`, with the safe hash/version reference.
+It never reports `queued`, `duplicate` or `delivered` from S3 metadata. On any
+unconfirmed publisher outcome it reports `failed / publication_unknown`, makes
+no retry, and retains the same unsigned pending payload and deployment success.
+No response body, OIDC token, signing key, signature or signed envelope appears
+in logs or the safe report. Only the controller's signed-release/scope
+validation and durable queue receipt can establish intake.
+
+S3 conditional writes protect the **current** version. A missing current object
+or a current delete marker can permit another write to the same key; versioning
+alone is not permanent immutability, as described in
+[S3 conditional-write semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
+The actual bucket versioning, retention,
+delete protection and create-only IAM policy must be reviewed before activation.
+There is no retry timestamp, alternate-key recovery or publisher readback in
+this unit. Never rerun deployment or regenerate timestamps to resend an unknown
+publication. Preserve the original unsigned payload/signature inputs and expiry;
+operator reconciliation and any recovery publication require a separate decision.
+
+Live qualification remains gated on a pinned/qualified CLI artifact, an isolated
+CI execution environment, a separately selected OIDC publication role with exact
+trust and destination permissions, actual service identity/network behavior,
+immutable version/checksum behavior, and independent controller intake proof.
+Publisher IAM must not inherit the deployment role or gain Get/List as an
+unreviewed recovery convenience. No role, workflow permission, secret, caller
+adoption or actual AWS CLI/cloud call is added by this draft.
+
+The existing native test script also runs synthetic publisher/CLI fixtures for
+activation denial, clean environment/identity selection, exact key/checksum and
+frozen body, body/output limits, pin mismatch, version/checksum rejection,
+409/412/lost ACK uncertainty, scratch/group cleanup, all prior HTTPS behavior,
+and distinct publication/deployment/controller outcomes. Test CLI versions and
+OIDC values are public fixtures, not qualified deployment configuration.
