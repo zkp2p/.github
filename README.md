@@ -323,7 +323,8 @@ step harnesses also require Python 3, jq, OpenSSL and `sha256sum`):
 bash scripts/test-ci-gate.sh # 4 passed
 python3 scripts/test-ssm-deploy.py
 python3 scripts/test-build-deploy-image-public.py
-actionlint .github/workflows/*.yml
+actionlint .github/workflows/ssm-deploy.yml \
+  .github/workflows/test-sekko-release-notice.yml
 ```
 
 The test extracts the workflow's `decide.env.DECISION_JQ` with

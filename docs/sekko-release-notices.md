@@ -162,21 +162,26 @@ deploy gates`, runs these checks on a fixed Ubuntu 24.04 runner with read-only
 `contents`, pinned checkout and no deploy/publish steps or supplied credentials:
 notice tests, the actual existing Docker/yq deploy harness, and actionlint 1.7.12
 from its versioned official release archive verified against a fixed SHA-256.
+Lint covers the two affected workflows, `ssm-deploy.yml` and
+`test-sekko-release-notice.yml`, with all actionlint rules enabled. Version
+1.7.12 does not recognize the unrelated baseline `test-patch-node24.yml` matrix
+label `ubuntu-26.04`; that workflow is outside this change's lint scope. No
+baseline workflow, runner label or generic ignore rule is changed.
 It does not replace the Docker/yq bootstrap with a parser shim. The actionlint
 Linux x64 digest is `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`.
 No native CI result is claimed until that PR check has actually run.
 
-
 ```bash
 python3 scripts/test-sekko-release-notice.py
 python3 scripts/test-ssm-deploy.py
-actionlint .github/workflows/*.yml
+actionlint .github/workflows/ssm-deploy.yml \
+  .github/workflows/test-sekko-release-notice.yml
 ```
 
 The notice harness uses only local fixtures and injected transports, including
 canonical signing, opt-out and every eligibility/config gate, mismatched
 readiness/SHA, transport and HTTP retry classes, duplicate acknowledgement,
-redirect rejection, constant retry bytes, bounded response reads, verified TLS
+redirect rejection, constant retry bytes, bounded response reads, verified TLS,
 lost acknowledgements, unsigned-payload persistence before signing, stale cleanup,
 and safe gap evidence. No live inbox/readiness/deployment/provider/model is
 called. The existing deploy harness additionally requires Docker and its
