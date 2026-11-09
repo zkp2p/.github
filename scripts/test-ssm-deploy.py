@@ -105,13 +105,19 @@ class DeployTests(unittest.TestCase):
     def test_sekko_delivery_gap_is_separate_and_preserved(self):
         summary = step("deploy", "Record Sekko delivery gap")
         artifact = step("deploy", "Preserve failed Sekko delivery report")
-        for item in (summary, artifact):
+        pending = step("deploy", "Preserve unsigned pending Sekko payload")
+        for item in (summary, artifact, pending):
             self.assertEqual(item["if"], "always() && steps.sekko-notice.outcome == 'failure'")
             self.assertTrue(item["continue-on-error"])
         self.assertIn("Do not redeploy to resend", summary["run"])
         self.assertEqual(artifact["with"]["path"], "${{ runner.temp }}/sekko-release-notice-report.json")
         self.assertEqual(artifact["with"]["retention-days"], 7)
         self.assertRegex(artifact["uses"], r"^actions/upload-artifact@[a-f0-9]{40}$")
+        self.assertEqual(pending["uses"], artifact["uses"])
+        self.assertEqual(pending["with"]["path"], "${{ runner.temp }}/sekko-release-notice-pending.json")
+        self.assertEqual(pending["with"]["if-no-files-found"], "ignore")
+        self.assertEqual(pending["with"]["retention-days"], 7)
+        self.assertNotEqual(pending["with"]["name"], artifact["with"]["name"])
 
     def test_host_timeout_input(self):
         host_timeout = WORKFLOW["on"]["workflow_call"]["inputs"].get("host-timeout-seconds", {})

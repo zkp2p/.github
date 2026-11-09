@@ -503,7 +503,7 @@ jobs:
           steps.require-deploy.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 2
-        uses: zkp2p/.github/actions/sekko-release-notice@065ae21f28e4764b0bbadfbeccda3b66ac433a68 # local helper commit; publish before adoption
+        uses: zkp2p/.github/actions/sekko-release-notice@4a3064abcdbf662ef246b4c4c2a03aeb05f538ba # local helper commit; publish before adoption
         env:
           SEKKO_NOTICE_ENABLED: ${{ inputs.sekko-release-notice }}
           SEKKO_NOTICE_CONFIG: ${{ inputs.sekko-notice-config }}
@@ -533,4 +533,13 @@ jobs:
           name: sekko-release-notice-gap-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/sekko-release-notice-report.json
           if-no-files-found: warn
+          retention-days: 7
+      - name: Preserve unsigned pending Sekko payload
+        if: always() && steps.sekko-notice.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sekko-release-payload-pending-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sekko-release-notice-pending.json
+          if-no-files-found: ignore
           retention-days: 7
