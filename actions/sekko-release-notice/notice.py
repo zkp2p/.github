@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one bounded notice. No private imports, subprocesses, proxies, or redirects."""
+"""Sign one bounded notice; HTTPS by default, trusted publisher injection only."""
 
 from __future__ import annotations
 
@@ -72,11 +72,15 @@ def endpoint(value):
     return value
 
 
-def configuration(raw, encoded_key):
+def configuration(raw, encoded_key, *, require_inbox=True):
     config = document(raw.encode("utf-8"))
-    if set(config) != {"inbox_url", "scope_id", "target_id", "surface", "origin", "description"}:
+    fields = {"scope_id", "target_id", "surface", "origin", "description"}
+    if require_inbox:
+        fields.add("inbox_url")
+    if set(config) != fields:
         raise NoticeError("invalid_config")
-    endpoint(config["inbox_url"])
+    if require_inbox:
+        endpoint(config["inbox_url"])
     if config["origin"] != STAGING_ORIGIN:
         raise NoticeError("invalid_config")
     if any(not isinstance(config[name], str) or not IDENTIFIER.fullmatch(config[name])
@@ -129,13 +133,15 @@ def eligible(env):
     }.items())
 
 
-def execute(env, *, persist_payload, transport=request, now=time.time, sleep=time.sleep):
+def execute(env, *, persist_payload, transport=request, now=time.time, sleep=time.sleep,
+            publisher=None):
     report = {"status": "skipped", "reason": "not_eligible", "attempts": 0}
     if not eligible(env):
         return report
     report.update(status="failed", reason="invalid_config", deployment_outcome="success")
     try:
-        config, key = configuration(env.get("SEKKO_NOTICE_CONFIG", ""), env.get("SEKKO_RELEASE_KEY", ""))
+        config, key = configuration(env.get("SEKKO_NOTICE_CONFIG", ""), env.get("SEKKO_RELEASE_KEY", ""),
+                                    require_inbox=publisher is None)
         sha = env.get("NOTICE_SOURCE_SHA", "")
         run = env.get("NOTICE_RUN_ID", "")
         attempt = env.get("NOTICE_RUN_ATTEMPT", "")
@@ -169,6 +175,23 @@ def execute(env, *, persist_payload, transport=request, now=time.time, sleep=tim
         body = canonical({"key_id": "release-ci", "purpose": "release-v1",
                           "payload": payload, "signature": signature})
         # Freeze these bytes once: retries must not change timestamp, ID or signature.
+        if len(body) > MAX_BYTES:
+            raise NoticeError("invalid_document")
+        if publisher is not None:
+            report["attempts"] = 1
+            try:
+                receipt = publisher(event, body)
+                if (type(receipt) is not dict or set(receipt) != {"status", "version_id", "body_sha256"}
+                        or receipt["status"] != "published"
+                        or receipt["body_sha256"] != hashlib.sha256(body).hexdigest()
+                        or type(receipt["version_id"]) is not str or receipt["version_id"] == "null"
+                        or not re.fullmatch(r"[A-Za-z0-9._~+/=-]{1,1024}", receipt["version_id"])):
+                    raise ValueError()
+            except Exception:
+                raise NoticeError("publication_unknown") from None
+            report.update(status="published", reason="controller_intake_unconfirmed",
+                          body_sha256=receipt["body_sha256"], version_id=receipt["version_id"])
+            return report
         for number in range(1, ATTEMPTS + 1):
             report["attempts"] = number
             try:
@@ -203,7 +226,7 @@ def write_pending(path, raw):
         os.fsync(output.fileno())
 
 
-def main(*, transport=request, now=time.time, sleep=time.sleep):
+def main(*, transport=request, now=time.time, sleep=time.sleep, publisher=None):
     pending = Path(os.environ["RUNNER_TEMP"]) / "sekko-release-notice-pending.json"
     # Remove this task's exact stale filename even when the new config is invalid.
     pending.unlink(missing_ok=True)
@@ -213,7 +236,7 @@ def main(*, transport=request, now=time.time, sleep=time.sleep):
     path.write_bytes(canonical({"status": "failed", "reason": "interrupted", "attempts": 0}) + b"\n")
     path.chmod(0o600)
     report = execute(os.environ, persist_payload=lambda raw: write_pending(pending, raw),
-                     transport=transport, now=now, sleep=sleep)
+                     transport=transport, now=now, sleep=sleep, publisher=publisher)
     path.write_bytes(canonical(report) + b"\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("status=" + report["status"] + "\n")
@@ -222,6 +245,8 @@ def main(*, transport=request, now=time.time, sleep=time.sleep):
             summary.write("Sekko release-notice delivery gap: **" + report["reason"]
                           + "**. Deployment outcome is separate; do not redeploy to resend. "
                           "See the safe report and unsigned pending payload artifacts if present.\n")
+        elif report["status"] == "published":
+            summary.write("Sekko release notice: published to object storage; controller intake unconfirmed.\n")
         else:
             summary.write("Sekko release notice: " + report["status"] + ".\n")
     if report["status"] == "failed":

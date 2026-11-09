@@ -2,6 +2,7 @@
 """Local fixture/injected transport tests only; no sockets or external services."""
 
 import contextlib
+import base64
 import hashlib
 import io
 import hmac
@@ -11,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,6 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("notice", ROOT / "actions/sekko-release-notice/notice.py")
 notice = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(notice)
+PUBLISHER_SPEC = importlib.util.spec_from_file_location("publisher", ROOT / "actions/sekko-release-notice/publisher.py")
+publisher = importlib.util.module_from_spec(PUBLISHER_SPEC)
+sys.modules[PUBLISHER_SPEC.name] = publisher
+PUBLISHER_SPEC.loader.exec_module(publisher)
 SHA = "a" * 40
 KEY = "01" * 32  # Public deterministic fixture, never a credential.
 CONFIG = {"inbox_url": "https://inbox.example.test/v1/releases", "scope_id": "reviewed-scope",
@@ -313,6 +319,354 @@ class NoticeTests(unittest.TestCase):
             self.assertIn("do not redeploy", combined)
             self.assertEqual(Path(temp, "output").read_text(), "status=failed\n")
             self.assertEqual(Path(temp, "sekko-release-notice-report.json").stat().st_mode & 0o777, 0o600)
+
+
+class PublisherTests(unittest.TestCase):
+    EVENT = f"pay:staging:41051883943:2:{SHA}"
+    TOKEN = b"synthetic.ci_oidc.fixture"  # Public fake, never a usable identity.
+    ROLE = "arn:aws:iam::411399509833:role/sekko-release-publisher"  # Proposed binding, not provisioned here.
+
+    def setUp(self):
+        self.calls, self.roots, self.saved = [], [], []
+        self.body = notice.canonical({"key_id": "release-ci", "purpose": "release-v1",
+                                      "payload": {"event_id": self.EVENT}, "signature": "1" * 64})
+        self.checksum = base64.b64encode(hashlib.sha256(self.body).digest()).decode()
+        self.reply = publisher.CommandResult(0, notice.canonical({"VersionId": "immutable-version+1",
+                                            "ChecksumSHA256": self.checksum, "ChecksumType": "FULL_OBJECT"}))
+
+    def runner(self, argv, *, cwd, env):
+        self.calls.append((argv, dict(env)))
+        self.roots.append(cwd)
+        self.assertTrue(cwd.is_dir())
+        self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(list(Path(env["HOME"]).iterdir()), [])
+        self.assertEqual(Path(env["AWS_CONFIG_FILE"]).read_bytes(), b"")
+        self.assertEqual(Path(env["AWS_SHARED_CREDENTIALS_FILE"]).read_bytes(), b"")
+        self.assertEqual(Path(env["AWS_WEB_IDENTITY_TOKEN_FILE"]).read_bytes(), self.TOKEN)
+        for name in ("body", "config", "credentials", "oidc"):
+            self.assertEqual((cwd / name).stat().st_mode & 0o777, 0o600)
+        self.assertEqual((cwd / "body").read_bytes(), self.body)
+        if argv[1:] == ("--version",):
+            return publisher.CommandResult(0, b"aws-cli/2.31.20 Python/3 fixture\n")
+        self.saved.append((cwd / "body").read_bytes())
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+    def client(self, **changes):
+        options = {"expected_version": "2.31.20", "activated": True, "qualified": True,
+                   "identity": publisher.OidcPublicationIdentity(self.ROLE, self.TOKEN), "runner": self.runner}
+        options.update(changes)
+        return publisher.AwsCliPublisher("/qualified/aws", **options)
+
+    def test_inactive_import_construction_and_each_gate_never_execute_cli(self):
+        for changes in ({"activated": False}, {"qualified": False}, {"identity": None}):
+            with self.subTest(changes=changes):
+                client = self.client(**changes)
+                self.assertEqual(self.calls, [])
+                with self.assertRaises(publisher.PublicationInactive):
+                    client(self.EVENT, self.body)
+                self.assertEqual(self.calls, [])
+        with patch.object(publisher.subprocess, "Popen", side_effect=AssertionError("no CLI")):
+            publisher.AwsCliPublisher("/qualified/aws", expected_version="2.31.20")
+
+    def test_strict_trusted_configuration_and_no_static_identity_interface(self):
+        for changes in ({"expected_version": "latest"}, {"expected_version": "2.31.20\n"},
+                        {"activated": 1}, {"qualified": "true"}, {"identity": {"AWS_ACCESS_KEY_ID": "fake"}},
+                        {"runner": 1}):
+            with self.subTest(changes=changes), self.assertRaises(publisher.PublicationError):
+                self.client(**changes)
+        with self.assertRaises(publisher.PublicationError):
+            publisher.AwsCliPublisher("aws", expected_version="2.31.20")
+        for role, token in ((self.ROLE.replace("411399509833", "000000000000"), self.TOKEN),
+                            ("arn:aws:iam::411399509833:role/peer-deploy", self.TOKEN),
+                            (self.ROLE, b"static-key"), (self.ROLE, self.TOKEN * 2000),
+                            (self.ROLE + "\n", self.TOKEN), (self.ROLE, "token")):
+            with self.subTest(role=role), self.assertRaises(publisher.PublicationError):
+                publisher.OidcPublicationIdentity(role, token)
+        self.assertNotIn(self.TOKEN.decode(), repr(publisher.OidcPublicationIdentity(self.ROLE, self.TOKEN)))
+
+    def test_exact_frozen_bytes_fixed_hash_destination_and_one_conditional_put(self):
+        receipt = self.client()(self.EVENT, self.body)
+        self.assertEqual(receipt, {"status": "published", "version_id": "immutable-version+1",
+                                  "body_sha256": hashlib.sha256(self.body).hexdigest()})
+        self.assertEqual(len(self.calls), 2)
+        argv, env = self.calls[1]
+        self.assertEqual(argv[:3], ("/qualified/aws", "s3api", "put-object"))
+        request = json.loads(argv[argv.index("--cli-input-json") + 1])
+        self.assertEqual(request, {"Bucket": "zkp2p-sekko-releases-411399509833-us-east-1",
+                                  "Key": "notices/v1/pay-api/staging/" + hashlib.sha256(self.EVENT.encode()).hexdigest() + ".json",
+                                  "ExpectedBucketOwner": "411399509833", "IfNoneMatch": "*",
+                                  "ContentLength": len(self.body), "ContentType": "application/json",
+                                  "ChecksumAlgorithm": "SHA256", "ChecksumSHA256": self.checksum})
+        self.assertEqual(argv[argv.index("--region") + 1], "us-east-1")
+        self.assertEqual(argv[argv.index("--endpoint-url") + 1], "https://s3.us-east-1.amazonaws.com")
+        self.assertEqual(self.saved, [self.body])
+        self.assertTrue(all(not root.exists() for root in self.roots))
+        for private in (self.body.decode(), self.TOKEN.decode()):
+            self.assertNotIn(private, repr(argv) + repr(receipt))
+
+    def test_clean_environment_ignores_ambient_profiles_keys_proxies_endpoints_and_roles(self):
+        ambient = {"AWS_PROFILE": "personal", "AWS_ACCESS_KEY_ID": "fake-personal", "AWS_SECRET_ACCESS_KEY": "fake",
+                   "AWS_SESSION_TOKEN": "fake", "AWS_ROLE_ARN": "deploy-role", "AWS_ENDPOINT_URL": "http://127.0.0.1",
+                   "HTTPS_PROXY": "http://127.0.0.1", "HTTP_PROXY": "http://127.0.0.1", "ALL_PROXY": "private",
+                   "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1", "PYTHONPATH": "ambient", "BOTO_CONFIG": "ambient"}
+        with patch.dict(os.environ, ambient):
+            self.client()(self.EVENT, self.body)
+        env = self.calls[1][1]
+        for name in ambient:
+            if name not in ("AWS_ROLE_ARN", "BOTO_CONFIG"):
+                self.assertNotIn(name, env)
+        self.assertEqual(env["AWS_ROLE_ARN"], self.ROLE)
+        self.assertEqual(env["AWS_EC2_METADATA_DISABLED"], "true")
+        self.assertEqual(env["AWS_MAX_ATTEMPTS"], "1")
+        self.assertEqual(env["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"], "true")
+        self.assertEqual(env["NO_PROXY"], "*")
+        self.assertTrue(all(not root.exists() for root in self.roots))
+
+    def test_invalid_or_mismatched_event_and_envelope_do_not_execute_cli(self):
+        values = [(self.EVENT + "/evil", self.body), (self.EVENT, b""), (self.EVENT, b"x" * 65537),
+                  (self.EVENT, bytearray(self.body)), (self.EVENT, b"{}"), (self.EVENT, b"not-json"),
+                  (self.EVENT, self.body.replace(b"release-v1", b"scope-v1")),
+                  (self.EVENT, self.body.replace(self.EVENT.encode(), b"wrong")),
+                  (self.EVENT, self.body.replace(b'"purpose":"release-v1"', b'"purpose":"release-v1","purpose":"release-v1"'))]
+        for event, body in values:
+            with self.subTest(length=len(body)), self.assertRaises(publisher.PublicationError):
+                self.client()(event, body)
+        self.assertEqual(self.calls, [])
+
+    def test_body_hard_limit_and_original_whitespace_bytes_are_preserved(self):
+        self.body += b" " * (65536 - len(self.body))
+        self.checksum = base64.b64encode(hashlib.sha256(self.body).digest()).decode()
+        self.reply = publisher.CommandResult(0, notice.canonical({"VersionId": "v", "ChecksumSHA256": self.checksum}))
+        self.client()(self.EVENT, self.body)
+        self.assertEqual(self.saved, [self.body])
+
+    def test_409_412_timeout_lost_ack_and_nonzero_results_are_unknown_without_retry(self):
+        for reply in (TimeoutError("private lost ACK"), OSError("private"),
+                      publisher.CommandResult(409, b"private conflict"), publisher.CommandResult(412, b"private exists"),
+                      publisher.CommandResult(1, b"private credentials"), publisher.CommandResult(True, b"{}")):
+            self.calls, self.saved = [], []
+            self.reply = reply
+            with self.subTest(reply=type(reply)), self.assertRaisesRegex(publisher.PublicationUnknown, "^publication_unknown$"):
+                self.client()(self.EVENT, self.body)
+            self.assertEqual(len(self.calls), 2)
+            self.assertEqual(self.saved, [self.body])
+            self.assertTrue(all(not root.exists() for root in self.roots))
+
+    def test_missing_malformed_or_mismatched_immutable_proof_never_succeeds(self):
+        valid = {"VersionId": "v", "ChecksumSHA256": self.checksum}
+        fixtures = [b"{}", b"[]", b"not-json", b"x" * (publisher.MAX_OUTPUT + 1),
+                    b'{"VersionId":"v","VersionId":"v"}', b'{"VersionId":NaN}']
+        for version in (None, "", "null", True, "x" * 1025, "v\n"):
+            fixtures.append(notice.canonical({**valid, "VersionId": version}))
+        fixtures += [notice.canonical({"VersionId": "v"}), notice.canonical({**valid, "ChecksumSHA256": "wrong"}),
+                     notice.canonical({**valid, "ChecksumType": "COMPOSITE"})]
+        for raw in fixtures:
+            self.calls = []
+            self.reply = publisher.CommandResult(0, raw)
+            with self.subTest(rawlen=len(raw)), self.assertRaises(publisher.PublicationUnknown):
+                self.client()(self.EVENT, self.body)
+            self.assertEqual(len(self.calls), 2)
+
+    def test_version_pin_failure_prevents_put_and_cleans_scratch(self):
+        for reply in (publisher.CommandResult(0, b"aws-cli/2.31.21 fixture"), publisher.CommandResult(0, b""),
+                      publisher.CommandResult(1, b"private"), publisher.CommandResult(0, b"x" * 2049)):
+            roots = []
+            def runner(argv, *, cwd, env):
+                roots.append(cwd)
+                self.assertEqual(argv[1:], ("--version",))
+                return reply
+            with self.assertRaises(publisher.PublicationUnknown):
+                self.client(runner=runner)(self.EVENT, self.body)
+            self.assertTrue(roots)
+            self.assertTrue(all(not root.exists() for root in roots))
+
+    def test_notice_injected_seam_preserves_gates_signing_and_no_https_post(self):
+        calls, saved, clocks, published = [], [], [], []
+        config = {key: value for key, value in CONFIG.items() if key != "inbox_url"}
+        env = {**ENV, "SEKKO_NOTICE_CONFIG": json.dumps(config)}
+        def transport(method, url, body=None):
+            calls.append((method, url))
+            self.assertEqual(method, "GET")
+            return 200, notice.canonical(READY)
+        def publish(event, body):
+            self.assertEqual(saved, [notice.canonical(json.loads(body)["payload"])])
+            self.assertEqual(event, self.EVENT)
+            signed = hmac.new(bytes.fromhex(KEY), b"release-v1\x00" + saved[0], hashlib.sha256).hexdigest()
+            self.assertEqual(json.loads(body)["signature"], signed)
+            published.append(body)
+            return {"status": "published", "version_id": "v", "body_sha256": hashlib.sha256(body).hexdigest()}
+        result = notice.execute(env, persist_payload=saved.append, transport=transport,
+                                publisher=publish, now=lambda: clocks.append(True) or 1000,
+                                sleep=lambda _: self.fail("no publication retry"))
+        self.assertEqual((result["status"], result["reason"], result["attempts"], result["deployment_outcome"]),
+                         ("published", "controller_intake_unconfirmed", 1, "success"))
+        self.assertEqual(len(published), 1)
+        self.assertEqual(clocks, [True])
+        self.assertEqual(calls, [("GET", notice.STAGING_ORIGIN + "/readyz")])
+        for gate in ("SEKKO_NOTICE_ENABLED", "NOTICE_DEPLOY_RESULT"):
+            skipped = notice.execute({**env, gate: "false"}, persist_payload=lambda *_: self.fail("persist"),
+                                     publisher=lambda *_: self.fail("publish"), transport=lambda *_: self.fail("probe"))
+            self.assertEqual(skipped["status"], "skipped")
+        failed = notice.execute(env, persist_payload=lambda *_: self.fail("persist"),
+                                publisher=lambda *_: self.fail("publish"), transport=lambda *_: (503, b"private"))
+        self.assertEqual(failed["reason"], "readiness_failed")
+
+    def test_unknown_publication_and_invalid_receipt_keep_successful_deployment_and_safe_evidence(self):
+        for outcome in (TimeoutError("private token and signed envelope"), None, {"status": "queued"},
+                        {"status": "published", "version_id": "null", "body_sha256": "wrong"}):
+            with self.subTest(outcome=type(outcome)), tempfile.TemporaryDirectory() as temp:
+                attempts = []
+                def publish(event, body):
+                    attempts.append(body)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                config = {key: value for key, value in CONFIG.items() if key != "inbox_url"}
+                env = {**ENV, "SEKKO_NOTICE_CONFIG": json.dumps(config), "RUNNER_TEMP": temp,
+                       "GITHUB_OUTPUT": temp + "/output", "GITHUB_STEP_SUMMARY": temp + "/summary"}
+                with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as captured:
+                    code = notice.main(transport=lambda *_: (200, notice.canonical(READY)), publisher=publish,
+                                       now=lambda: 1000, sleep=lambda _: self.fail("retry"))
+                report = json.loads(Path(temp, "sekko-release-notice-report.json").read_bytes())
+                self.assertEqual(code, 1)
+                self.assertEqual((report["reason"], report["deployment_outcome"], report["attempts"]),
+                                 ("publication_unknown", "success", 1))
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(Path(temp, "sekko-release-notice-pending.json").read_bytes(),
+                                 notice.canonical(json.loads(attempts[0])["payload"]))
+                combined = captured.getvalue() + json.dumps(report) + Path(temp, "summary").read_text()
+                for private in (KEY, "private", "signature", CONFIG["description"], CONFIG["inbox_url"]):
+                    self.assertNotIn(private, combined)
+                self.assertNotIn("queued", combined)
+
+    def test_published_main_reports_storage_only_without_controller_ack(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = {key: value for key, value in CONFIG.items() if key != "inbox_url"}
+            env = {**ENV, "SEKKO_NOTICE_CONFIG": json.dumps(config), "RUNNER_TEMP": temp,
+                   "GITHUB_OUTPUT": temp + "/output", "GITHUB_STEP_SUMMARY": temp + "/summary"}
+            def publish(event, body):
+                return {"status": "published", "version_id": "v", "body_sha256": hashlib.sha256(body).hexdigest()}
+            with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as captured:
+                self.assertEqual(notice.main(transport=lambda *_: (200, notice.canonical(READY)),
+                                             publisher=publish, now=lambda: 1000), 0)
+            report = json.loads(Path(temp, "sekko-release-notice-report.json").read_bytes())
+            self.assertEqual((report["status"], report["reason"]), ("published", "controller_intake_unconfirmed"))
+            self.assertEqual(Path(temp, "output").read_text(), "status=published\n")
+            self.assertIn("controller intake unconfirmed", Path(temp, "summary").read_text())
+            self.assertEqual(captured.getvalue(), "")
+
+    def test_bounded_runner_uses_pipes_no_shell_and_cleans_even_exited_leader(self):
+        process = unittest.mock.MagicMock(pid=123456789, returncode=0)
+        streams = []
+        for raw in (b"ack", b"private stderr"):
+            reader, writer = os.pipe()
+            os.write(writer, raw)
+            os.close(writer)
+            streams.append(os.fdopen(reader, "rb"))
+        process.stdout, process.stderr = streams
+        try:
+            with tempfile.TemporaryDirectory() as scratch, \
+                 patch.object(publisher.subprocess, "Popen", return_value=process) as popen, \
+                 patch.object(publisher.os, "killpg", side_effect=ProcessLookupError()) as kill:
+                result = publisher.BoundedCliRunner()(("/qualified/aws", "--version"), cwd=Path(scratch), env={})
+            self.assertEqual(result, publisher.CommandResult(0, b"ack"))
+            self.assertNotIn("private", repr(result))
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertTrue(popen.call_args.kwargs["close_fds"])
+            self.assertNotIn("shell", popen.call_args.kwargs)
+            self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            kill.assert_called_once_with(process.pid, publisher.signal.SIGTERM)
+            self.assertTrue(all(stream.closed for stream in streams))
+        finally:
+            for stream in streams:
+                stream.close()
+
+    def test_runner_output_overflow_and_deadline_stop_owned_group(self):
+        for limit, seconds in ((2, 5), (100, 0)):
+            process = unittest.mock.MagicMock(pid=123456789, returncode=0)
+            streams = []
+            for raw in (b"oversize", b"private"):
+                reader, writer = os.pipe()
+                os.write(writer, raw)
+                os.close(writer)
+                streams.append(os.fdopen(reader, "rb"))
+            process.stdout, process.stderr = streams
+            try:
+                with tempfile.TemporaryDirectory() as scratch, \
+                     patch.object(publisher, "MAX_OUTPUT", limit), patch.object(publisher, "COMMAND_SECONDS", seconds), \
+                     patch.object(publisher.subprocess, "Popen", return_value=process), \
+                     patch.object(publisher, "_stop_group") as stop:
+                    with self.assertRaises(publisher.PublicationUnknown):
+                        publisher.BoundedCliRunner()(("/qualified/aws",), cwd=Path(scratch), env={})
+                stop.assert_called_once_with(process)
+                self.assertTrue(all(stream.closed for stream in streams))
+            finally:
+                for stream in streams:
+                    stream.close()
+
+    def test_group_cleanup_kills_remaining_descendants_independently_of_leader(self):
+        process = unittest.mock.MagicMock(pid=123456789)
+        process.poll.return_value = 0
+        with patch.object(publisher.time, "monotonic", side_effect=range(20)), \
+             patch.object(publisher.os, "killpg", side_effect=[None, None, None, ProcessLookupError()]) as kill:
+            publisher._stop_group(process)
+        self.assertEqual(kill.call_args_list, [unittest.mock.call(process.pid, publisher.signal.SIGTERM),
+                                              unittest.mock.call(process.pid, 0),
+                                              unittest.mock.call(process.pid, publisher.signal.SIGKILL),
+                                              unittest.mock.call(process.pid, 0)])
+        process.wait.assert_called_once_with(timeout=1)
+        with patch.object(publisher.time, "monotonic", side_effect=range(20)), \
+             patch.object(publisher.os, "killpg", side_effect=PermissionError()):
+            with self.assertRaises(publisher.PublicationUnknown):
+                publisher._stop_group(process)
+
+    def test_cleanup_cannot_confirm_success_while_group_remains_after_kill(self):
+        process = unittest.mock.MagicMock(pid=123456789)
+        process.poll.return_value = 0
+        with patch.object(publisher.time, "monotonic", side_effect=range(20)), \
+             patch.object(publisher.time, "sleep"), patch.object(publisher.os, "killpg") as kill:
+            with self.assertRaisesRegex(publisher.PublicationUnknown, "^publication_unknown$"):
+                publisher._stop_group(process)
+        self.assertIn(unittest.mock.call(process.pid, publisher.signal.SIGKILL), kill.call_args_list)
+        process.wait.assert_called_once_with(timeout=1)
+
+    def test_valid_storage_receipt_stays_unknown_if_exited_leader_group_survives_kill(self):
+        process = unittest.mock.MagicMock(pid=123456789)
+        process.poll.return_value = 0
+        def runner(argv, *, cwd, env):
+            result = self.runner(argv, cwd=cwd, env=env)
+            if argv[1:3] == ("s3api", "put-object"):
+                publisher._stop_group(process)
+            return result
+        with patch.object(publisher.time, "monotonic", side_effect=range(20)), \
+             patch.object(publisher.time, "sleep"), patch.object(publisher.os, "killpg"):
+            with self.assertRaisesRegex(publisher.PublicationUnknown, "^publication_unknown$"):
+                self.client(runner=runner)(self.EVENT, self.body)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.saved, [self.body])
+        self.assertTrue(all(not root.exists() for root in self.roots))
+
+    def test_scratch_size_entry_count_and_special_files_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bounded").write_bytes(b"x" * publisher.MAX_SCRATCH)
+            publisher._check_scratch(root)
+            with (root / "bounded").open("ab") as stream:
+                stream.write(b"x")
+            with self.assertRaises(publisher.PublicationUnknown):
+                publisher._check_scratch(root)
+            (root / "bounded").unlink()
+            for number in range(publisher.MAX_FILES + 1):
+                (root / str(number)).touch()
+            with self.assertRaises(publisher.PublicationUnknown):
+                publisher._check_scratch(root)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "link").symlink_to("/nonexistent-fixture")
+            with self.assertRaises(publisher.PublicationUnknown):
+                publisher._check_scratch(root)
 
 
 if __name__ == "__main__":
