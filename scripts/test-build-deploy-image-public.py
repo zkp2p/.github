@@ -72,7 +72,8 @@ class PublicBuildTests(unittest.TestCase):
         self.assertEqual(inputs["context"]["default"], ".")
         self.assertEqual(inputs["build-args"]["default"], "")
         for job in WORKFLOW["jobs"].values():
-            self.assertEqual(job["runs-on"], "ubuntu-latest")
+            # The recorded image ID must match the classic store on deploy hosts.
+            self.assertEqual(job["runs-on"], "ubuntu-24.04")
         self.assertEqual(JOB["permissions"], {"contents": "read", "id-token": "write"})
 
     def test_only_push_and_workflow_dispatch_allowed(self):

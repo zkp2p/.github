@@ -65,7 +65,9 @@ and [official archive checksums](https://nodejs.org/dist/v24.22.1/SHASUMS256.txt
 Use `.github/workflows/build-deploy-image-public.yml` for public repositories
 such as `zkp2p/peer-cli` that cannot call the reusable build workflow in the
 private `zkp2p/peer-infra` repository. It builds the caller's `github.sha` on
-`ubuntu-latest` and uploads an image artifact using AWS OIDC. Only caller events
+`ubuntu-24.04` and uploads an image artifact using AWS OIDC. The image is not
+built on `ubuntu-latest`: Ubuntu 26.04's Docker reports a manifest digest as the
+image ID, which the deploy hosts' classic image store never assigns. Only caller events
 `push` and `workflow_dispatch` are accepted; other events fail before checkout.
 The runner is fixed and cannot be overridden by the caller.
 

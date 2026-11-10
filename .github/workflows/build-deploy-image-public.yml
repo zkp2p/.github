@@ -36,7 +36,11 @@ permissions:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    # Fixed to 24.04: the 26.04 image's Docker keeps images in containerd and
+    # reports the manifest digest as the image ID. Deploy hosts load the saved
+    # image into the classic store, where the ID is the config digest, so the
+    # recorded ID would not exist on the host and the rollout preflight fails.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
