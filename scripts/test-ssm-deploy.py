@@ -239,7 +239,7 @@ class DeployTests(unittest.TestCase):
         })
         gate = WORKFLOW["jobs"]["ci-gate"]
         self.assertEqual(gate["needs"], "resolve")
-        self.assertEqual(gate["if"], "needs.resolve.outputs.ci == 'required' && inputs.mode == 'image'")
+        self.assertEqual(gate["if"], "needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
         deploy = WORKFLOW["jobs"]["deploy"]
         self.assertEqual(deploy["needs"], ["resolve", "ci-gate"])
         self.assertIn("needs.resolve.result == 'success'", deploy["if"])
@@ -279,6 +279,146 @@ class DeployTests(unittest.TestCase):
                         "ImageId": ["none"], "SourceSha": ["none"], "AllowKeyRemoval": [allow],
                         "RunId": ["41051883943"], "RunAttempt": ["2"],
                     })
+
+    def normalize_parent_parameters(self, **env):
+        values = {
+            "MODE": "parent", "ARTIFACT_KIND": "eif", "EIF_ENABLED": "true",
+            "IMAGE_ID": "parent:" + "c" * 64,
+            "ARTIFACT_KEY": "zkp2p/attestation-service/parent/" + "b" * 64 + "/parent-bundle.tar.gz",
+        }
+        return self.normalize_parameters(**{**values, **env})
+
+    def test_parent_mode_accepts_eif_parent_id(self):
+        self.assert_exit(self.run_step("resolve", "Validate artifact identity", MODE="parent",
+                                       ARTIFACT_KIND="eif", IMAGE_ID="parent:" + "0123456789abcdef" * 4,
+                                       EIF_ENABLED="true"), 0)
+
+    def test_parent_mode_rejects_docker(self):
+        for identity in ("parent:" + "c" * 64, "sha256:" + "c" * 64):
+            with self.subTest(identity=identity):
+                self.assert_exit(self.normalize_parent_parameters(ARTIFACT_KIND="docker",
+                                                                   IMAGE_ID=identity), 1)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_parent_mode_rejects_pcr0_id(self):
+        for identity in ("pcr0:" + "c" * 96, "sha256:" + "c" * 64, "", "none",
+                         "parent:" + "c" * 63, "parent:" + "c" * 65, "parent:" + "g" * 64,
+                         "parent:" + "C" * 64, "parent:" + "c" * 64 + "\n",
+                         " parent:" + "c" * 64):
+            with self.subTest(identity=identity):
+                self.assert_exit(self.normalize_parent_parameters(IMAGE_ID=identity), 1)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_parent_mode_runs_ci_gate(self):
+        self.assertEqual(WORKFLOW["jobs"]["ci-gate"]["if"],
+                         "needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
+        self.tool("gh", '''
+[[ "$1" == api ]]
+[[ "$2" == "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" ]]
+echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}'
+''')
+        gate = step("ci-gate", "Wait for CI on the image commit")
+        self.assert_exit(self.run_step("ci-gate", "Wait for CI on the image commit", MODE="parent",
+                                       SHA="d" * 40, CI_WORKFLOW="ci.yml",
+                                       DECISION_JQ=gate["env"]["DECISION_JQ"]), 0)
+
+    def test_parent_mode_normalized_ssm_parameters(self):
+        self.assertEqual(WORKFLOW["jobs"]["deploy"]["env"]["DEPLOY_ENVIRONMENT"],
+                         "${{ needs.resolve.outputs.environment }}")
+        for environment, prefix in (("staging", ""), ("prod", "prod/")):
+            with self.subTest(environment=environment):
+                key = f"zkp2p/attestation-service/{prefix}parent/{'b' * 64}/parent-bundle.tar.gz"
+                self.assert_exit(self.normalize_parent_parameters(DEPLOY_ENVIRONMENT=environment,
+                                                                   ARTIFACT_KEY=key), 0)
+                path = self.root / "ssm-parameters.json"
+                self.assertEqual(json.loads(path.read_text()), {
+                    "Mode": ["parent"], "ArtifactKey": [key], "ManifestSha256": ["b" * 64],
+                    "ImageId": ["parent:" + "c" * 64], "SourceSha": ["a" * 40],
+                    "AllowKeyRemoval": ["false"], "RunId": ["41051883943"], "RunAttempt": ["2"],
+                })
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_image_mode_unchanged(self):
+        for kind, identity, artifact, enabled, allow in (
+            ("docker", "sha256:" + "c" * 64, "image", "", "false"),
+            ("docker", "sha256:" + "c" * 64, "image", "false", "true"),
+            ("eif", "pcr0:" + "0123456789abcdef" * 6, "attestation-eif", "true", "false"),
+        ):
+            for environment, prefix in (("staging", ""), ("prod", "prod/")):
+                with self.subTest(kind=kind, environment=environment, allow=allow):
+                    key = f"zkp2p/attestation-service/{prefix}41051883943/2/{artifact}.tar.gz"
+                    result = self.normalize_parameters(ARTIFACT_KIND=kind, IMAGE_ID=identity,
+                                                       ARTIFACT_KEY=key, EIF_ENABLED=enabled,
+                                                       ALLOW_KEY_REMOVAL=allow, DEPLOY_ENVIRONMENT=environment)
+                    self.assert_exit(result, 0)
+                    expected = {
+                        "Mode": ["image"], "ArtifactKey": [key], "ManifestSha256": ["b" * 64],
+                        "ImageId": [identity], "SourceSha": ["a" * 40], "AllowKeyRemoval": [allow],
+                        "RunId": ["41051883943"], "RunAttempt": ["2"],
+                    }
+                    self.assertEqual((self.root / "ssm-parameters.json").read_bytes(),
+                                     (json.dumps(expected, indent=2) + "\n").encode())
+                    self.assertEqual((result.stdout, result.stderr), ("", ""))
+
+    def test_parent_mode_requires_eif_opt_in(self):
+        for enabled in ("", "false", "1", "TRUE", "true\n"):
+            with self.subTest(enabled=enabled):
+                result = self.normalize_parent_parameters(EIF_ENABLED=enabled)
+                self.assert_exit(result, 1)
+                self.assertIn("SSM_DEPLOY_EIF_ENABLED=true", result.stderr)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_parent_mode_rejects_key_removal(self):
+        for allow in ("true", "", "FALSE", "false\n"):
+            with self.subTest(allow=allow):
+                self.assert_exit(self.normalize_parent_parameters(ALLOW_KEY_REMOVAL=allow), 1)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_parent_mode_rejects_invalid_artifact_keys(self):
+        for name in ("aws", "gh", "curl", "docker"):
+            self.tool(name, 'echo called >> "$STATE/external-calls"; exit 99')
+        for environment, prefix, other_prefix in (("staging", "", "prod/"), ("prod", "prod/", "")):
+            base = f"zkp2p/attestation-service/{prefix}parent/"
+            key = base + "b" * 64 + "/parent-bundle.tar.gz"
+            for invalid in (
+                "", "none", f"zkp2p/attestation-service/{prefix}41051883943/2/attestation-eif.tar.gz",
+                f"zkp2p/attestation-service/{other_prefix}parent/{'b' * 64}/parent-bundle.tar.gz",
+                key.replace("zkp2p/attestation-service", "example/repo"),
+                key.replace("parent/", "parent//"), key.replace("parent/", "parent/../parent/"),
+                key.replace("parent-bundle.tar.gz", "attestation-eif.tar.gz"),
+                key.replace("parent-bundle.tar.gz", "parent-manifest.json"),
+                key.replace("parent-bundle.tar.gz", "parent-bundleXtarXgz"),
+                base + "b" * 63 + "/parent-bundle.tar.gz", base + "b" * 65 + "/parent-bundle.tar.gz",
+                base + "B" * 64 + "/parent-bundle.tar.gz", base + "g" * 64 + "/parent-bundle.tar.gz",
+                base + "c" * 64 + "/parent-bundle.tar.gz",  # Key digest must match the manifest, not ImageId.
+                "/" + key, "s3://bucket/" + key, " " + key, key + "\n", key + "/extra", key + "?versionId=x",
+            ):
+                with self.subTest(environment=environment, key=invalid):
+                    self.assert_exit(self.normalize_parent_parameters(DEPLOY_ENVIRONMENT=environment,
+                                                                       ARTIFACT_KEY=invalid), 1)
+                    self.assertFalse((self.root / "ssm-parameters.json").exists())
+                    self.assertFalse((self.root / "external-calls").exists())
+        for environment in ("", "production", "dev", "STAGING", "staging\n"):
+            with self.subTest(environment=environment):
+                self.assert_exit(self.normalize_parent_parameters(DEPLOY_ENVIRONMENT=environment), 1)
+                self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_parent_mode_rejects_invalid_manifest_and_source(self):
+        for field, size in (("MANIFEST_SHA256", 64), ("SOURCE_SHA", 40)):
+            for value in ("", "none", "a" * (size - 1), "a" * (size + 1), "g" * size,
+                          "A" * size, "a" * size + "\n"):
+                with self.subTest(field=field, value=value):
+                    self.assert_exit(self.normalize_parent_parameters(**{field: value}), 1)
+                    self.assertFalse((self.root / "ssm-parameters.json").exists())
+
+    def test_image_mode_rejects_parent_artifact_keys(self):
+        for kind, identity in (("docker", "sha256:" + "c" * 64), ("eif", "pcr0:" + "c" * 96)):
+            for prefix in ("", "prod/"):
+                with self.subTest(kind=kind, prefix=prefix):
+                    key = f"zkp2p/attestation-service/{prefix}parent/{'b' * 64}/parent-bundle.tar.gz"
+                    self.assert_exit(self.normalize_parameters(ARTIFACT_KIND=kind, IMAGE_ID=identity,
+                                                               ARTIFACT_KEY=key, EIF_ENABLED="true"), 1)
+                    self.assertFalse((self.root / "ssm-parameters.json").exists())
 
     def test_invalid_artifact_identity_fails_before_external_calls(self):
         for name in ("aws", "gh", "curl", "docker"):

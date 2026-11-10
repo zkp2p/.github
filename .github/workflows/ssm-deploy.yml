@@ -91,6 +91,16 @@ jobs:
                 exit 1
               fi
               ;;
+            parent)
+              if [[ "$ARTIFACT_KIND" != eif ]]; then
+                echo 'parent mode requires artifact-kind=eif' >&2
+                exit 1
+              fi
+              if [[ ! "$IMAGE_ID" =~ ^parent:[a-f0-9]{64}$ ]]; then
+                echo 'parent mode requires image-id=parent:<64 lowercase hex>' >&2
+                exit 1
+              fi
+              ;;
             config|config-plan)
               if [[ "$ARTIFACT_KIND" != docker ]]; then
                 echo 'config and config-plan require artifact-kind=docker' >&2
@@ -187,7 +197,7 @@ jobs:
 
   ci-gate:
     needs: resolve
-    if: needs.resolve.outputs.ci == 'required' && inputs.mode == 'image'
+    if: needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 50
     permissions:
@@ -278,7 +288,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$MODE" in
-            image)
+            image|parent)
               for key in ARTIFACT_KEY MANIFEST_SHA256 IMAGE_ID SOURCE_SHA; do
                 if [[ -z "${!key}" || "${!key}" == none ]]; then
                   printf 'Image deploy requires %s\n' "$key" >&2
@@ -289,6 +299,21 @@ jobs:
               if [[ ! "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ||
                     ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
                 echo 'Invalid MANIFEST_SHA256 or SOURCE_SHA' >&2
+                exit 1
+              fi
+              if [[ "$MODE" == parent ]]; then
+                case "$DEPLOY_ENVIRONMENT" in
+                  staging) parent_prefix='zkp2p/attestation-service/parent/' ;;
+                  prod) parent_prefix='zkp2p/attestation-service/prod/parent/' ;;
+                  *) echo 'parent mode requires staging or prod' >&2; exit 1 ;;
+                esac
+                if [[ "$ARTIFACT_KEY" != "${parent_prefix}${MANIFEST_SHA256}/parent-bundle.tar.gz" ]]; then
+                  echo 'Invalid parent artifact-key for environment or manifest' >&2
+                  exit 1
+                fi
+              elif [[ "$ARTIFACT_KEY" == zkp2p/attestation-service/parent/* ||
+                      "$ARTIFACT_KEY" == zkp2p/attestation-service/prod/parent/* ]]; then
+                echo 'Parent artifact-key requires parent mode' >&2
                 exit 1
               fi
               ;;

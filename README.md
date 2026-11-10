@@ -185,11 +185,11 @@ the final success gate depends only on log polling and deployment-status recordi
 
 | Input | Contract |
 | --- | --- |
-| `mode` | Required: `image`, `config` or `config-plan`. |
+| `mode` | Required: `image`, `parent`, `config` or `config-plan`. `parent` installs an attestation parent bundle and requires `artifact-kind: eif`. |
 | `artifact-kind` | Optional string, default `docker`; accepts `docker` or `eif`. Config modes require `docker`. EIF requires the caller repository variable `SSM_DEPLOY_EIF_ENABLED` to equal `true`. |
-| `artifact-key` | Required string; S3 artifact key in image mode. |
-| `manifest-sha256` | Required string; 64 lowercase hex characters in image mode. |
-| `image-id` | Required string; in image mode, `sha256:` followed by 64 lowercase hex characters for Docker, or `pcr0:` followed by 96 lowercase hex characters for EIF. |
+| `artifact-key` | Required string; S3 artifact key in image mode. In parent mode it must be exactly `zkp2p/attestation-service/parent/<manifest-sha256>/parent-bundle.tar.gz` for staging, or `zkp2p/attestation-service/prod/parent/<manifest-sha256>/parent-bundle.tar.gz` for prod. |
+| `manifest-sha256` | Required string; 64 lowercase hex characters in image and parent modes. |
+| `image-id` | Required string; in image mode, `sha256:` followed by 64 lowercase hex characters for Docker, or `pcr0:` followed by 96 lowercase hex characters for EIF. In parent mode, `parent:` followed by the 64 lowercase hex parent source fingerprint. |
 | `source-sha` | Required string; full lowercase commit SHA of the artifact, supplied as `github.sha`. |
 | `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. EIF requires `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
@@ -217,6 +217,18 @@ force **all four**, including `source-sha`, to `none` before sending the command
 regardless of caller values. GitHub deployment records and notification metadata
 still identify the caller commit. `config-plan` delegates the dry run to the host
 document; `allow-key-removal` is enforced by the host bridge.
+
+### Parent mode (attestation only)
+
+`mode: parent` installs a signed attestation parent bundle (cred-server,
+vsock-tls-proxy, nginx vhost and upstreams, parent units) through the same SSM
+document as EIF deploys. It requires `artifact-kind: eif`, the
+`SSM_DEPLOY_EIF_ENABLED=true` opt-in, `allow-key-removal: false`, an `image-id`
+of `parent:<64 hex>` and the exact environment-scoped bundle key shown above.
+The CI gate runs as it does for image mode. A parent bundle key is rejected in
+image mode, and an EIF key is rejected in parent mode. The host verifies the
+bundle's KMS signature against its pinned public key; this workflow only
+forwards the request.
 
 ### EIF artifacts (dormant by default)
 
