@@ -1,0 +1,4 @@
+# Recognize the hosted image used here with older actionlint releases.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

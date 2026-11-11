@@ -31,6 +31,10 @@ on:
       ci-workflow:
         type: string
         default: ci.yml
+      ci-tree-reuse:
+        description: Allow successful CI for an identical Git tree to satisfy the gate.
+        type: boolean
+        default: false
       host-timeout-seconds:
         description: Maximum seconds to follow the host command (integer, 600..6600).
         type: number
@@ -49,21 +53,24 @@ defaults:
     shell: bash
 
 jobs:
-  resolve:
+  deploy:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 10
+    # Cover resolution, the CI gate and the maximum host follow with existing margins.
+    timeout-minutes: 190
     permissions:
       contents: read
-    outputs:
-      environment: ${{ steps.resolve.outputs.environment }}
-      instance-id: ${{ steps.resolve.outputs.instance-id }}
-      role-arn: ${{ steps.resolve.outputs.role-arn }}
-      region: ${{ steps.resolve.outputs.region }}
-      document: ${{ steps.resolve.outputs.document }}
-      log-group: ${{ steps.resolve.outputs.log-group }}
-      ci: ${{ steps.resolve.outputs.ci }}
-      follow-timeout-minutes: ${{ steps.timeouts.outputs.follow-timeout-minutes }}
-      deploy-timeout-minutes: ${{ steps.timeouts.outputs.deploy-timeout-minutes }}
+      actions: write
+      id-token: write
+      deployments: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      MODE: ${{ inputs.mode }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      AWS_PAGER: ''
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: '3'
     steps:
       - name: Validate artifact identity
         env:
@@ -194,23 +201,17 @@ jobs:
               then . else error("Invalid environment configuration") end
           ')
           jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$outputs" >> "$GITHUB_OUTPUT"
-
-  ci-gate:
-    needs: resolve
-    if: needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 50
-    permissions:
-      actions: write
-    steps:
       - name: Wait for CI on the image commit
         id: decide
+        if: steps.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')
+        timeout-minutes: 50
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ inputs.source-sha }}
           REF: ${{ github.ref_name }}
           CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          CI_TREE_REUSE: ${{ inputs.ci-tree-reuse }}
           DECISION_JQ: |
             .workflow_runs
             | if type != "array" then error("Missing workflow_runs")
@@ -219,10 +220,26 @@ jobs:
               elif length > 0 then "fail"
               else "dispatch"
               end
+          RUNNER_LOSS_JQ: |
+            [.[].jobs[]]
+            | any(.[]; .conclusion == "failure" or .conclusion == "cancelled")
+              and all(.[]; (.steps | type == "array")
+                and all(.steps[]; .conclusion != "failure"))
+          TREE_REUSE_JQ: |
+            .workflow_runs
+            | if type != "array" then error("Missing workflow_runs") else . end
+            | [.[] | select(.status == "completed" and .conclusion == "success"
+                and .head_commit.tree_id == $tree)
+              | select(.html_url | type == "string" and length > 0)
+              | select(.head_sha | type == "string" and length == 40 and test("^[a-fA-F0-9]{40}$"))]
+            | .[0] // empty
+            | [.html_url, .head_sha] | @tsv
         run: |
           set -euo pipefail
           started=$(date +%s)
           dispatched=false
+          poll=0
+          reused_run=''
           while (( $(date +%s) - started < 2700 )); do
             runs=$(timeout 60s gh api \
               "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" \
@@ -231,8 +248,49 @@ jobs:
               exit 1
             }
             decision=$(jq -er "$DECISION_JQ" <<< "$runs")
+            if [[ "$decision" != pass && "$CI_TREE_REUSE" == true ]] && (( poll % 5 == 0 )); then
+              if commit=$(timeout 60s gh api "repos/$REPO/git/commits/$SHA" 2>/dev/null) &&
+                 tree=$(jq -er '.tree.sha | select(type == "string" and length == 40
+                   and test("^[a-fA-F0-9]{40}$"))' <<< "$commit" 2>/dev/null) &&
+                 successes=$(timeout 60s gh api \
+                   "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?status=success&per_page=100" \
+                   2>/dev/null) &&
+                 reused_run=$(jq -er --arg tree "$tree" "$TREE_REUSE_JQ" <<< "$successes" 2>/dev/null); then
+                decision='pass'
+              fi
+            fi
+            poll=$((poll + 1))
+            if [[ "$decision" == fail ]]; then
+              if failed_run=$(jq -er '
+                .workflow_runs | max_by(.created_at, .id)
+                | select(.id | type == "number")
+                | select(.run_attempt == 1 or .run_attempt == 2)
+                | [.id, .run_attempt, (.updated_at | fromdateiso8601)] | @tsv
+              ' <<< "$runs" 2>/dev/null); then
+                read -r run_id run_attempt updated_at <<< "$failed_run"
+                if (( $(date +%s) < updated_at + 600 )) &&
+                   jobs=$(timeout 60s gh api --paginate --slurp \
+                     "repos/$REPO/actions/runs/$run_id/attempts/$run_attempt/jobs?per_page=100" \
+                     2>/dev/null) &&
+                   jq -e "$RUNNER_LOSS_JQ" <<< "$jobs" >/dev/null 2>&1 &&
+                   (( $(date +%s) < updated_at + 600 )); then
+                  printf 'CI run %s attempt %s: runner-loss grace; waiting up to 10 minutes after %s\n' \
+                    "$run_id" "$run_attempt" "$(jq -r '.workflow_runs | max_by(.created_at, .id) | .updated_at' <<< "$runs")"
+                  decision='wait'
+                fi
+              fi
+            fi
+            if (( $(date +%s) - started >= 2700 )); then
+              break
+            fi
             case "$decision" in
-              pass) exit 0 ;;
+              pass)
+                if [[ -n "$reused_run" ]]; then
+                  read -r reused_url reused_sha <<< "$reused_run"
+                  printf 'Reusing successful CI run %s (head_sha %s)\n' "$reused_url" "$reused_sha"
+                fi
+                exit 0
+                ;;
               fail) echo 'CI failed for the image commit' >&2; exit 1 ;;
               wait) ;;
               dispatch)
@@ -251,32 +309,10 @@ jobs:
           done
           echo 'CI did not pass within 45 minutes' >&2
           exit 1
-
-  deploy:
-    needs: [resolve, ci-gate]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped') }}
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.deploy-timeout-minutes) }}
-    permissions:
-      id-token: write
-      deployments: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      SHA: ${{ github.sha }}
-      MODE: ${{ inputs.mode }}
-      DEPLOY_ENVIRONMENT: ${{ needs.resolve.outputs.environment }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      AWS_PAGER: ''
-      AWS_RETRY_MODE: standard
-      AWS_MAX_ATTEMPTS: '3'
-    steps:
-      - name: Patch hosted action runtime
-        if: runner.environment == 'github-hosted'
-        uses: zkp2p/.github/actions/patch-node24@4ef0030bb0aca98a6c4a6378dbf48ad159ff25d4 # reviewed runtime patch
       - name: Normalize deploy parameters
         id: normalize
         env:
+          DEPLOY_ENVIRONMENT: ${{ steps.resolve.outputs.environment }}
           ARTIFACT_KEY: ${{ inputs.artifact-key }}
           MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
           IMAGE_ID: ${{ inputs.image-id }}
@@ -295,7 +331,7 @@ jobs:
                   exit 1
                 fi
               done
-              # The resolve job already validated IMAGE_ID against artifact-kind.
+              # Artifact identity was already validated against artifact-kind.
               if [[ ! "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ||
                     ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
                 echo 'Invalid MANIFEST_SHA256 or SOURCE_SHA' >&2
@@ -341,8 +377,8 @@ jobs:
       - name: Assume deploy role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ needs.resolve.outputs.role-arn }}
-          aws-region: ${{ needs.resolve.outputs.region }}
+          role-to-assume: ${{ steps.resolve.outputs.role-arn }}
+          aws-region: ${{ steps.resolve.outputs.region }}
           role-session-name: deploy-${{ github.event.repository.name }}-${{ github.run_id }}
           role-duration-seconds: 7200
           mask-aws-account-id: true
@@ -352,6 +388,8 @@ jobs:
       - name: Create GitHub deployment
         id: deployment
         if: inputs.mode != 'config-plan'
+        env:
+          DEPLOY_ENVIRONMENT: ${{ steps.resolve.outputs.environment }}
         run: |
           set -euo pipefail
           task=deploy
@@ -376,9 +414,9 @@ jobs:
       - name: Send SSM command
         id: command
         env:
-          DOCUMENT: ${{ needs.resolve.outputs.document }}
-          INSTANCE_ID: ${{ needs.resolve.outputs.instance-id }}
-          LOG_GROUP: ${{ needs.resolve.outputs.log-group }}
+          DOCUMENT: ${{ steps.resolve.outputs.document }}
+          INSTANCE_ID: ${{ steps.resolve.outputs.instance-id }}
+          LOG_GROUP: ${{ steps.resolve.outputs.log-group }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -399,11 +437,11 @@ jobs:
           printf 'command-id=%s\nstarted-at=%s\n' "$command_id" "$started_at" >> "$GITHUB_OUTPUT"
       - name: Follow command logs
         id: poll
-        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.follow-timeout-minutes) }}
+        timeout-minutes: ${{ fromJSON(steps.timeouts.outputs.follow-timeout-minutes) }}
         env:
           COMMAND_ID: ${{ steps.command.outputs.command-id }}
           STARTED_AT: ${{ steps.command.outputs.started-at }}
-          LOG_GROUP: ${{ needs.resolve.outputs.log-group }}
+          LOG_GROUP: ${{ steps.resolve.outputs.log-group }}
           HOST_TIMEOUT_SECONDS: ${{ inputs.host-timeout-seconds }}
         run: |
           set -euo pipefail
@@ -486,8 +524,9 @@ jobs:
             exit 1
           }
       - name: Notify Slack if configured
-        if: always()
+        if: always() && steps.normalize.outcome != 'skipped'
         env:
+          DEPLOY_ENVIRONMENT: ${{ steps.resolve.outputs.environment }}
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           RESULT: ${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}
         run: |
@@ -503,7 +542,7 @@ jobs:
               exit 0
             }
       - name: Require successful deploy
-        if: always()
+        if: always() && steps.normalize.outcome != 'skipped'
         env:
           RESULT: ${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}
         run: test "$RESULT" = success

@@ -121,6 +121,12 @@ and follows its CloudWatch logs. Pin the reusable workflow to a reviewed commit.
 All deployment infrastructure identifiers come from the caller's environment
 map; the SSM workflow contains no deployment credentials or account configuration.
 
+A single `deploy` job validates inputs, checks out and resolves the environment
+map, waits for required CI, then deploys. It uses `inputs.runner` throughout,
+so ephemeral runners are acquired only once. Callers' failed-job names are now
+`<caller job> / deploy`, including validation and CI failures. The peer-infra
+config-cd reconciler is being updated separately to recognize this job name.
+
 The caller's `deploy/environments.yml` uses this schema (replace placeholders
 in the caller repository):
 
@@ -196,19 +202,22 @@ the final success gate depends only on log polling and deployment-status recordi
 | `allow-key-removal` | Boolean, default `false`; sent to SSM as `true` or `false`. EIF requires `false`. |
 | `environments-file` | Default `deploy/environments.yml`, relative to the caller repository. |
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
+| `ci-tree-reuse` | Boolean, default `false`. Allow a successful run of `ci-workflow` for an identical Git tree to satisfy the CI gate. |
 | `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `6600` inclusive. Maximum time to follow the host command, in seconds. |
 | `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
 
 The host timeout is validated before checkout or CI gating. The follow step timeout
-is `ceil(host-timeout-seconds / 60) + 1` minutes; the deploy job timeout is
-`ceil(host-timeout-seconds / 60) + 15` minutes. The default preserves the existing
-66-minute step and 80-minute job limits. For example, `host-timeout-seconds: 5700`
-follows for 95 minutes, with a 96-minute step and a 110-minute job.
+is `ceil(host-timeout-seconds / 60) + 1` minutes (66 minutes by default, or
+96 minutes for `host-timeout-seconds: 5700`). The single job has a static
+190-minute bound, covering environment resolution, the CI gate and the maximum
+110-minute host follow plus the existing margins. The CI wait has its own
+50-minute step timeout and retains its 45-minute polling cap.
 
-The maximum is 6600 seconds because the deploy job's AWS credentials last 7200
-seconds, also the module role's maximum session duration. This leaves 600 seconds
-of headroom for delivery and the steps before log following; longer follows could
-outlast the credentials and lose CloudWatch access.
+The maximum is 6600 seconds because the deploy role's AWS credentials last 7200
+seconds, also the module role's maximum session duration. The role is assumed
+only after CI passes or is skipped. This leaves 600 seconds of headroom for
+delivery and the steps before log following; longer follows could outlast the
+credentials and lose CloudWatch access.
 
 Environment resolution uses the runner's preinstalled mikefarah/yq, verified by
 `yq --version`, and falls back to `mikefarah/yq:4.44.3` in Docker only when yq is
@@ -292,11 +301,32 @@ by the attestation/peer-infra caller integration.
 
 ### CI and command following
 
-For image deploys with `ci: required`, the workflow polls CI for the image commit
-every 30 seconds for up to 45 minutes. A completed success passes; otherwise any
-unfinished run keeps it waiting, completed unsuccessful runs fail, and no runs
-triggers one dispatch followed by polling. Config modes and `ci: skip` bypass
-this gate.
+For image and parent deploys with `ci: required`, the workflow polls CI for the
+source commit every 30 seconds for up to 45 minutes. A completed success passes;
+otherwise any unfinished run keeps it waiting, completed unsuccessful runs fail,
+and no runs triggers one dispatch followed by polling. Config modes and `ci: skip`
+bypass this gate.
+
+When only completed unsuccessful runs exist, the newest run gets a runner-loss
+grace period if its latest attempt has failed or cancelled jobs but no failed
+step anywhere. Attempts 1 and 2 wait until 10 minutes after the run's `updated_at`
+to let the spot re-run automation start a new attempt; a running attempt then
+uses the normal wait path. A failed step, attempt 3, an expired grace period or
+unreadable job evidence fails immediately. The grace does not extend the overall
+45-minute cap. Each API call remains bounded to 60 seconds.
+
+Set `ci-tree-reuse: true` in the caller's `with` mapping to reuse CI for the same
+Git tree, such as a squash merge whose tree matches a successful PR head. When
+the source SHA has no successful run, the gate resolves its tree and checks up
+to 100 successful runs of the configured CI workflow for a matching
+`head_commit.tree_id`. It checks on the initial poll and after every five further
+polls, logging the reused run's URL and head SHA on success. An invalid tree SHA,
+API error or missing match falls back to the normal SHA decision. With the input
+omitted or `false`, no tree lookups occur.
+
+Enable reuse only when identical trees provide equivalent CI evidence across
+the caller's PR and release contexts; branch/event-specific checks or external
+inputs can differ even when the source files match.
 
 The deploy role must support a 7,200-second OIDC session and permit sending only
 the intended document to its target instance, plus reading its CloudWatch log
@@ -326,20 +356,25 @@ Run the local checks from the repository root (Docker must be running; the shell
 step harnesses also require Python 3, jq, OpenSSL and `sha256sum`):
 
 ```bash
-bash scripts/test-ci-gate.sh # 4 passed
+bash scripts/test-ci-gate.sh
 python3 scripts/test-ssm-deploy.py
 python3 scripts/test-build-deploy-image-public.py
 actionlint .github/workflows/*.yml
 ```
 
-The test extracts the workflow's `decide.env.DECISION_JQ` with
-`mikefarah/yq:4.44.3` and checks success, failure with an unfinished run, failure
-only, and empty results. The shell step harness checks host timeout validation and
-rounding, yq selection, log pagination and deduplication, polling failures/timeouts,
-Slack failures, and the final success gate with isolated fake external commands.
+The test extracts the workflow's CI decision, runner-loss and tree-reuse jq
+filters with `mikefarah/yq:4.44.3` and checks success, failure with an unfinished run, failure
+only, empty results and failed-step evidence across job pages. The shell step
+harness checks host timeout validation and rounding, yq selection, log pagination
+and deduplication, polling failures/timeouts, Slack failures, and the final success
+gate with isolated fake external commands.
 It also checks Docker/EIF identity validation, dormant EIF gating, unchanged SSM
 parameters and config normalization, run/attempt forwarding, delivery timeout,
 and exact-SHA CI polling with a single dispatch through a fake `gh` command.
+Runner-loss checks cover grace expiry, real failed steps, the latest attempt,
+the re-run limit, API errors and the overall CI deadline.
+Tree-reuse checks cover matching and mismatched trees, malformed data, API errors,
+the opt-in default, lookup cadence and the overall deadline.
 These checks do not exercise a live deployment or call AWS/GitHub APIs.
 
 The public build harness checks the event guard, fixed hosted runner, caller
