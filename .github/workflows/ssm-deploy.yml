@@ -31,6 +31,10 @@ on:
       ci-workflow:
         type: string
         default: ci.yml
+      ci-tree-reuse:
+        description: Allow successful CI for an identical Git tree to satisfy the gate.
+        type: boolean
+        default: false
       host-timeout-seconds:
         description: Maximum seconds to follow the host command (integer, 600..6600).
         type: number
@@ -207,6 +211,7 @@ jobs:
           SHA: ${{ inputs.source-sha }}
           REF: ${{ github.ref_name }}
           CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          CI_TREE_REUSE: ${{ inputs.ci-tree-reuse }}
           DECISION_JQ: |
             .workflow_runs
             | if type != "array" then error("Missing workflow_runs")
@@ -220,10 +225,21 @@ jobs:
             | any(.[]; .conclusion == "failure" or .conclusion == "cancelled")
               and all(.[]; (.steps | type == "array")
                 and all(.steps[]; .conclusion != "failure"))
+          TREE_REUSE_JQ: |
+            .workflow_runs
+            | if type != "array" then error("Missing workflow_runs") else . end
+            | [.[] | select(.status == "completed" and .conclusion == "success"
+                and .head_commit.tree_id == $tree)
+              | select(.html_url | type == "string" and length > 0)
+              | select(.head_sha | type == "string" and length == 40 and test("^[a-fA-F0-9]{40}$"))]
+            | .[0] // empty
+            | [.html_url, .head_sha] | @tsv
         run: |
           set -euo pipefail
           started=$(date +%s)
           dispatched=false
+          poll=0
+          reused_run=''
           while (( $(date +%s) - started < 2700 )); do
             runs=$(timeout 60s gh api \
               "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" \
@@ -232,6 +248,18 @@ jobs:
               exit 1
             }
             decision=$(jq -er "$DECISION_JQ" <<< "$runs")
+            if [[ "$decision" != pass && "$CI_TREE_REUSE" == true ]] && (( poll % 5 == 0 )); then
+              if commit=$(timeout 60s gh api "repos/$REPO/git/commits/$SHA" 2>/dev/null) &&
+                 tree=$(jq -er '.tree.sha | select(type == "string" and length == 40
+                   and test("^[a-fA-F0-9]{40}$"))' <<< "$commit" 2>/dev/null) &&
+                 successes=$(timeout 60s gh api \
+                   "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?status=success&per_page=100" \
+                   2>/dev/null) &&
+                 reused_run=$(jq -er --arg tree "$tree" "$TREE_REUSE_JQ" <<< "$successes" 2>/dev/null); then
+                decision='pass'
+              fi
+            fi
+            poll=$((poll + 1))
             if [[ "$decision" == fail ]]; then
               if failed_run=$(jq -er '
                 .workflow_runs | max_by(.created_at, .id)
@@ -256,7 +284,13 @@ jobs:
               break
             fi
             case "$decision" in
-              pass) exit 0 ;;
+              pass)
+                if [[ -n "$reused_run" ]]; then
+                  read -r reused_url reused_sha <<< "$reused_run"
+                  printf 'Reusing successful CI run %s (head_sha %s)\n' "$reused_url" "$reused_sha"
+                fi
+                exit 0
+                ;;
               fail) echo 'CI failed for the image commit' >&2; exit 1 ;;
               wait) ;;
               dispatch)

@@ -44,6 +44,7 @@ class DeployTests(unittest.TestCase):
             "MANIFEST_SHA256": "b" * 64, "IMAGE_ID": "sha256:" + "c" * 64,
             "SOURCE_SHA": "a" * 40, "ALLOW_KEY_REMOVAL": "false",
             "RUN_ID": "41051883943", "RUN_ATTEMPT": "2", "RUNNER_TEMP": str(self.root),
+            "CI_TREE_REUSE": "false",
         }
         self.tool("timeout", 'shift\nexec "$@"')
         self.tool("date", 'printf "%s\\n" "${NOW:-1000}"')
@@ -531,17 +532,38 @@ esac
                 "created_at": "1970-01-01T00:10:00Z", "updated_at": "1970-01-01T00:15:00Z",
                 **values}
 
-    def ci_api(self, runs, jobs=None):
+    def ci_api(self, runs, jobs=None, commit=None, tree_runs=None):
+        for name in ("ci-index", "ci-sleeps", "gh-calls", "ci-tree-index"):
+            (self.root / name).unlink(missing_ok=True)
         for index, response in enumerate(runs):
             (self.root / f"ci-{index}.json").write_text(json.dumps({"workflow_runs": response}))
         if jobs is not None:
             (self.root / "ci-jobs.json").write_text(json.dumps(jobs))
+        if commit is not None:
+            (self.root / "ci-commit.json").write_text(json.dumps(commit))
+        if tree_runs is not None:
+            for index, response in enumerate(tree_runs):
+                (self.root / f"ci-tree-{index}.json").write_text(json.dumps({"workflow_runs": response}))
         self.tool("timeout", '[[ "$1" == 60s ]]; shift; exec "$@"')
         self.tool("gh", '''
 printf '%s\\n' "$*" >> "$STATE/gh-calls"
 if [[ "$*" == "workflow run $CI_WORKFLOW --ref $REF --repo $REPO" ]]; then exit 0; fi
 [[ "$1" == api ]]
 shift
+case "$1" in
+  "repos/$REPO/git/commits/$SHA")
+    jq . "$STATE/ci-commit.json"
+    [[ "${CI_TREE_ERROR:-}" != commit ]]
+    exit
+    ;;
+  "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?status=success&per_page=100")
+    index=$(jq -r . "$STATE/ci-tree-index" 2>/dev/null || echo 0)
+    echo "$((index + 1))" > "$STATE/ci-tree-index"
+    jq . "$STATE/ci-tree-$index.json"
+    [[ "${CI_TREE_ERROR:-}" != runs ]]
+    exit
+    ;;
+esac
 if [[ "$1" == --paginate ]]; then
   [[ "$2" == --slurp ]]
   shift 2
@@ -631,6 +653,123 @@ fi
         self.assert_exit(result, 1)
         self.assertIn("CI did not pass within 45 minutes", result.stderr)
         self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"])
+
+    def test_ci_tree_reuse_is_opt_in(self):
+        inputs = WORKFLOW["on"]["workflow_call"]["inputs"]
+        self.assertEqual(inputs["ci-tree-reuse"]["type"], "boolean")
+        self.assertIs(inputs["ci-tree-reuse"]["default"], False)
+        self.assertEqual(step("deploy", "Wait for CI on the image commit")["env"]["CI_TREE_REUSE"],
+                         "${{ inputs.ci-tree-reuse }}")
+
+    def successful_tree_run(self, tree="e" * 40, **values):
+        return self.ci_run(conclusion="success", head_commit={"tree_id": tree},
+                           html_url="https://example.invalid/actions/runs/99", head_sha="b" * 40, **values)
+
+    def test_ci_tree_match_passes_before_fail_wait_or_dispatch(self):
+        for runs in ([self.ci_run(run_attempt=3)],
+                     [self.ci_run(status="in_progress", conclusion=None)], []):
+            with self.subTest(runs=runs):
+                self.ci_api([runs], commit={"tree": {"sha": "e" * 40}},
+                            tree_runs=[[self.successful_tree_run()]])
+                result = self.run_ci(CI_TREE_REUSE="true")
+                self.assert_exit(result, 0)
+                self.assertIn("https://example.invalid/actions/runs/99", result.stdout)
+                self.assertIn("b" * 40, result.stdout)
+                self.assertFalse((self.root / "ci-sleeps").exists())
+                calls = (self.root / "gh-calls").read_text()
+                self.assertNotIn("workflow run", calls)
+                self.assertNotIn("/jobs", calls)
+
+    def test_ci_tree_mismatch_preserves_fail_wait_or_dispatch(self):
+        for runs, expected, dispatch in (([self.ci_run(run_attempt=3)], 1, False),
+                                         ([self.ci_run(status="in_progress", conclusion=None)], 0, False),
+                                         ([], 0, True)):
+            with self.subTest(runs=runs):
+                self.ci_api([runs, [self.ci_run(conclusion="success")]],
+                            commit={"tree": {"sha": "e" * 40}},
+                            tree_runs=[[self.successful_tree_run(tree="f" * 40)]])
+                result = self.run_ci(CI_TREE_REUSE="true")
+                self.assert_exit(result, expected)
+                self.assertNotIn("Reusing", result.stdout)
+                calls = (self.root / "gh-calls").read_text()
+                self.assertEqual("workflow run" in calls, dispatch)
+                self.assertEqual((self.root / "ci-sleeps").exists(), expected == 0)
+
+    def test_ci_tree_invalid_sha_never_passes_or_lists_runs(self):
+        for tree in ("", "e" * 39, "e" * 41, "g" * 40, None, 123, "e" * 40 + "\n"):
+            with self.subTest(tree=tree):
+                self.ci_api([[self.ci_run(run_attempt=3)]], commit={"tree": {"sha": tree}},
+                            tree_runs=[[self.successful_tree_run()]])
+                result = self.run_ci(CI_TREE_REUSE="true")
+                self.assert_exit(result, 1)
+                self.assertIn("CI failed for the image commit", result.stderr)
+                self.assertNotIn("status=success", (self.root / "gh-calls").read_text())
+
+    def test_ci_tree_api_errors_never_pass_even_with_matching_output(self):
+        for endpoint in ("commit", "runs"):
+            with self.subTest(endpoint=endpoint):
+                self.ci_api([[self.ci_run(run_attempt=3)]], commit={"tree": {"sha": "e" * 40}},
+                            tree_runs=[[self.successful_tree_run()]])
+                result = self.run_ci(CI_TREE_REUSE="true", CI_TREE_ERROR=endpoint)
+                self.assert_exit(result, 1)
+                self.assertIn("CI failed for the image commit", result.stderr)
+                self.assertNotIn("Reusing", result.stdout)
+
+    def test_ci_tree_api_error_falls_back_to_normal_wait(self):
+        for endpoint in ("commit", "runs"):
+            with self.subTest(endpoint=endpoint):
+                self.ci_api([[self.ci_run(status="in_progress", conclusion=None)],
+                             [self.ci_run(conclusion="success")]],
+                            commit={"tree": {"sha": "e" * 40}}, tree_runs=[[self.successful_tree_run()]])
+                result = self.run_ci(CI_TREE_REUSE="true", CI_TREE_ERROR=endpoint)
+                self.assert_exit(result, 0)
+                self.assertNotIn("Reusing", result.stdout)
+                self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"])
+
+    def test_ci_tree_malformed_responses_do_not_pass(self):
+        for name in ("ci-commit.json", "ci-tree-0.json"):
+            for response in ('{"message": "not found"}', 'not json'):
+                with self.subTest(name=name, response=response):
+                    self.ci_api([[self.ci_run(run_attempt=3)]], commit={"tree": {"sha": "e" * 40}},
+                                tree_runs=[[self.successful_tree_run()]])
+                    (self.root / name).write_text(response)
+                    result = self.run_ci(CI_TREE_REUSE="true")
+                    self.assert_exit(result, 1)
+                    self.assertIn("CI failed for the image commit", result.stderr)
+
+    def test_ci_tree_lookup_disabled_or_exact_sha_passes(self):
+        for enabled, conclusion, expected in (("false", "failure", 1), ("true", "success", 0)):
+            with self.subTest(enabled=enabled, conclusion=conclusion):
+                self.ci_api([[self.ci_run(conclusion=conclusion, run_attempt=3)]])
+                result = self.run_ci(CI_TREE_REUSE=enabled)
+                self.assert_exit(result, expected)
+                calls = (self.root / "gh-calls").read_text()
+                self.assertNotIn("/git/commits/", calls)
+                self.assertNotIn("status=success", calls)
+
+    def test_ci_tree_lookup_repeats_after_five_polls(self):
+        self.ci_api([[self.ci_run(status="in_progress", conclusion=None)]] * 6,
+                    commit={"tree": {"sha": "e" * 40}}, tree_runs=[[], [self.successful_tree_run()]])
+        result = self.run_ci(CI_TREE_REUSE="true")
+        self.assert_exit(result, 0)
+        calls = (self.root / "gh-calls").read_text().splitlines()
+        polls = 0
+        lookup_polls = []
+        for call in calls:
+            if "head_sha=" in call:
+                polls += 1
+            if "status=success" in call:
+                lookup_polls.append(polls)
+        self.assertEqual(lookup_polls, [1, 6])
+        self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"] * 5)
+
+    def test_ci_tree_reuse_does_not_pass_after_overall_deadline(self):
+        self.ci_api([[self.ci_run(status="in_progress", conclusion=None)]],
+                    commit={"tree": {"sha": "e" * 40}}, tree_runs=[[self.successful_tree_run()]])
+        self.tool("date", 'if [[ -f "$STATE/ci-tree-index" ]]; then echo 3700; else echo 1000; fi')
+        result = self.run_ci(CI_TREE_REUSE="true")
+        self.assert_exit(result, 1)
+        self.assertIn("CI did not pass within 45 minutes", result.stderr)
 
     def test_send_command_preserves_parameters_and_delivery_timeout(self):
         self.tool("aws", '''
