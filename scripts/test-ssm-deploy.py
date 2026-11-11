@@ -594,8 +594,31 @@ fi
         self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30", "30"])
         self.assertEqual((self.root / "gh-calls").read_text().count("/attempts/1/jobs"), 1)
 
+    def test_ci_lost_support_shards_and_failed_aggregator_wait_for_new_attempt(self):
+        jobs = [{"jobs": [
+            {"name": f"support-api tests ({shard}/4)", "conclusion": "failure",
+             "steps": [{"conclusion": "success"}, {"conclusion": "cancelled"}]}
+            for shard in range(1, 4)
+        ] + [{"name": "support-api tests (4/4)", "conclusion": "success",
+              "steps": [{"conclusion": "success"}]}]},
+            {"jobs": [{"name": "support / support-api", "conclusion": "failure",
+                       "steps": [{"name": "Require support-api build and every test shard",
+                                  "conclusion": "failure"}]}]}]
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                self.ci_api([[self.ci_run(run_attempt=attempt)],
+                             [self.ci_run(run_attempt=attempt + 1, status="in_progress", conclusion=None)],
+                             [self.ci_run(run_attempt=attempt + 1, conclusion="success")]], jobs=jobs)
+                result = self.run_ci(CI_ATTEMPT=str(attempt))
+                self.assert_exit(result, 0)
+                self.assertIn(f"CI run 42 attempt {attempt}: runner-loss grace; waiting up to 10 minutes "
+                              "after 1970-01-01T00:15:00Z", result.stdout)
+                self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30", "30"])
+                self.assertEqual((self.root / "gh-calls").read_text().count(f"/attempts/{attempt}/jobs"), 1)
+
     def test_ci_runner_loss_fails_at_grace_deadline(self):
-        self.ci_api([[self.ci_run()]], jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+        self.ci_api([[self.ci_run()]],
+                    jobs=[{"jobs": [{"conclusion": "failure", "steps": [{"conclusion": "cancelled"}]}]}])
         result = self.run_ci(NOW="1500")
         self.assert_exit(result, 1)
         self.assertIn("CI failed for the image commit", result.stderr)
@@ -603,14 +626,14 @@ fi
 
     def test_ci_runner_loss_grace_expires_while_waiting(self):
         self.ci_api([[self.ci_run()], [self.ci_run()]],
-                    jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+                    jobs=[{"jobs": [{"conclusion": "failure", "steps": [{"conclusion": "cancelled"}]}]}])
         self.tool("date", 'if [[ -f "$STATE/ci-sleeps" ]]; then echo 1500; else echo 1000; fi')
         result = self.run_ci()
         self.assert_exit(result, 1)
         self.assertIn("CI failed for the image commit", result.stderr)
         self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"])
 
-    def test_ci_failed_step_anywhere_fails_immediately(self):
+    def test_ci_failed_steps_without_runner_loss_fail_immediately(self):
         for conclusion in ("failure", "cancelled", "success"):
             with self.subTest(conclusion=conclusion):
                 (self.root / "ci-index").unlink(missing_ok=True)
@@ -623,6 +646,20 @@ fi
                 self.assertIn("CI failed for the image commit", result.stderr)
                 self.assertFalse((self.root / "ci-sleeps").exists())
 
+    def test_ci_invalid_or_empty_steps_do_not_get_grace(self):
+        for conclusion in ("failure", "cancelled"):
+            for evidence in ({}, {"steps": []}, {"steps": None}, {"steps": {}}, {"steps": "unknown"}):
+                with self.subTest(conclusion=conclusion, evidence=evidence):
+                    self.ci_api([[self.ci_run()]], jobs=[{"jobs": [
+                        {"conclusion": conclusion, **evidence},
+                        {"conclusion": "success", "steps": [{"conclusion": "success"}]},
+                    ]}])
+                    result = self.run_ci()
+                    self.assert_exit(result, 1)
+                    self.assertIn("CI failed for the image commit", result.stderr)
+                    self.assertNotIn("runner-loss grace", result.stdout)
+                    self.assertFalse((self.root / "ci-sleeps").exists())
+
     def test_ci_third_attempt_fails_without_grace(self):
         self.ci_api([[self.ci_run(run_attempt=3)]])
         result = self.run_ci()
@@ -634,7 +671,7 @@ fi
     def test_ci_grace_uses_newest_run_and_latest_attempt(self):
         newer = self.ci_run(id=43, run_attempt=2, created_at="1970-01-01T00:11:00Z")
         self.ci_api([[newer, self.ci_run()], [self.ci_run(conclusion="success")]],
-                    jobs=[{"jobs": [{"conclusion": "cancelled", "steps": []}]}])
+                    jobs=[{"jobs": [{"conclusion": "cancelled", "steps": [{"conclusion": "cancelled"}]}]}])
         result = self.run_ci(CI_RUN_ID="43", CI_ATTEMPT="2")
         self.assert_exit(result, 0)
         self.assertIn("/runs/43/attempts/2/jobs", (self.root / "gh-calls").read_text())
@@ -647,7 +684,8 @@ fi
         self.assertFalse((self.root / "ci-sleeps").exists())
 
     def test_ci_runner_loss_does_not_extend_overall_deadline(self):
-        self.ci_api([[self.ci_run()]], jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+        self.ci_api([[self.ci_run()]],
+                    jobs=[{"jobs": [{"conclusion": "failure", "steps": [{"conclusion": "cancelled"}]}]}])
         self.tool("date", 'if [[ -f "$STATE/ci-sleeps" ]]; then echo 3700; else echo 1000; fi')
         result = self.run_ci()
         self.assert_exit(result, 1)

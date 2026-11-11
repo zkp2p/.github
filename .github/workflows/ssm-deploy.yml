@@ -222,8 +222,8 @@ jobs:
               end
           RUNNER_LOSS_JQ: |
             [.[].jobs[]]
-            | any(.[]; .conclusion == "failure" or .conclusion == "cancelled")
-              and all(.[]; (.steps | type == "array")
+            | any(.[]; (.conclusion == "failure" or .conclusion == "cancelled")
+                and (.steps | type == "array" and length > 0)
                 and all(.steps[]; .conclusion != "failure"))
           TREE_REUSE_JQ: |
             .workflow_runs

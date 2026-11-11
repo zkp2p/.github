@@ -308,12 +308,15 @@ and no runs triggers one dispatch followed by polling. Config modes and `ci: ski
 bypass this gate.
 
 When only completed unsuccessful runs exist, the newest run gets a runner-loss
-grace period if its latest attempt has failed or cancelled jobs but no failed
-step anywhere. Attempts 1 and 2 wait until 10 minutes after the run's `updated_at`
-to let the spot re-run automation start a new attempt; a running attempt then
-uses the normal wait path. A failed step, attempt 3, an expired grace period or
-unreadable job evidence fails immediately. The grace does not extend the overall
-45-minute cap. Each API call remains bounded to 60 seconds.
+grace period if its latest attempt has at least one failed or cancelled job with
+a non-empty `steps` array and no failed step in that job. Other jobs may have
+failed steps, such as a downstream aggregator that requires the lost shards.
+The spot re-run automation re-runs all failed jobs, so a coincident genuine
+failure is checked again. Attempts 1 and 2 wait until 10 minutes after the run's
+`updated_at` to let that automation start a new attempt; a running attempt then
+uses the normal wait path. No qualifying runner loss, attempt 3, an expired grace
+period or a job-evidence API error fails immediately. The grace does not extend
+the overall 45-minute cap. Each API call remains bounded to 60 seconds.
 
 Set `ci-tree-reuse: true` in the caller's `with` mapping to reuse CI for the same
 Git tree, such as a squash merge whose tree matches a successful PR head. When
@@ -371,8 +374,9 @@ gate with isolated fake external commands.
 It also checks Docker/EIF identity validation, dormant EIF gating, unchanged SSM
 parameters and config normalization, run/attempt forwarding, delivery timeout,
 and exact-SHA CI polling with a single dispatch through a fake `gh` command.
-Runner-loss checks cover grace expiry, real failed steps, the latest attempt,
-the re-run limit, API errors and the overall CI deadline.
+Runner-loss checks cover three lost support-api shards with a failed aggregator,
+empty or invalid steps, grace expiry, real failures without runner loss, the
+latest attempt, the re-run limit, API errors and the overall CI deadline.
 Tree-reuse checks cover matching and mismatched trees, malformed data, API errors,
 the opt-in default, lookup cadence and the overall deadline.
 These checks do not exercise a live deployment or call AWS/GitHub APIs.

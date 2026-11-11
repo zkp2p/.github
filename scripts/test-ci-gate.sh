@@ -55,10 +55,24 @@ check_runner_loss() {
 }
 
 check_runner_loss 'lost runner' true '[{"jobs":[{"conclusion":"failure","steps":[{"conclusion":"cancelled"}]}]}]'
-check_runner_loss cancelled true '[{"jobs":[{"conclusion":"cancelled","steps":[]}]}]'
+support_runner_loss=$(jq -nc '
+  [{jobs: ([range(1; 4) | {name: "support-api tests (\(.)/4)", conclusion: "failure",
+      steps: [{conclusion: "success"}, {conclusion: "cancelled"}]}]
+    + [{name: "support-api tests (4/4)", conclusion: "success", steps: [{conclusion: "success"}]}])},
+   {jobs: [{name: "support / support-api", conclusion: "failure",
+     steps: [{name: "Require support-api build and every test shard", conclusion: "failure"}]}]}]
+')
+check_runner_loss 'three lost support shards + failed aggregator' true "$support_runner_loss"
+check_runner_loss 'failed aggregator before lost support shards' true "$(jq 'reverse' <<< "$support_runner_loss")"
+check_runner_loss cancelled true '[{"jobs":[{"conclusion":"cancelled","steps":[{"conclusion":"cancelled"}]}]}]'
+check_runner_loss 'cancelled runner + failed step' true '[{"jobs":[{"conclusion":"cancelled","steps":[{"conclusion":"cancelled"}]},{"conclusion":"failure","steps":[{"conclusion":"failure"}]}]}]'
 check_runner_loss 'failed step on another page' false '[{"jobs":[{"conclusion":"failure","steps":[]}]},{"jobs":[{"conclusion":"failure","steps":[{"conclusion":"failure"}]}]}]'
-check_runner_loss 'no failed jobs' false '[{"jobs":[{"conclusion":"success","steps":[]}]}]'
+check_runner_loss 'no failed jobs' false '[{"jobs":[{"conclusion":"success","steps":[{"conclusion":"success"}]}]}]'
+check_runner_loss 'empty steps' false '[{"jobs":[{"conclusion":"failure","steps":[]}]}]'
+check_runner_loss 'cancelled with empty steps' false '[{"jobs":[{"conclusion":"cancelled","steps":[]}]}]'
 check_runner_loss 'missing steps' false '[{"jobs":[{"conclusion":"failure"}]}]'
+check_runner_loss 'null steps' false '[{"jobs":[{"conclusion":"failure","steps":null}]}]'
+check_runner_loss 'invalid steps' false '[{"jobs":[{"conclusion":"failure","steps":{}}]}]'
 check_runner_loss 'empty jobs' false '[{"jobs":[]}]'
 
 check_tree() {
