@@ -198,6 +198,14 @@ the final success gate depends only on log polling and deployment-status recordi
 | `ci-workflow` | Default `ci.yml`. Must support dispatch on the release ref if no run exists. |
 | `host-timeout-seconds` | Optional number, default `3900`; integer from `600` to `6600` inclusive. Maximum time to follow the host command, in seconds. |
 | `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
+| `sekko-release-notice` | Optional boolean, default `false`; bounded post-success notice for Pay API staging image deploys only. |
+| `sekko-notice-config` | Optional JSON string, default empty; exact reviewed inbox/scope/target/surface/origin/description fields. |
+
+The optional `sekko-release-key` secret is a dedicated release signing key encoded
+as hex, exposed only to the opt-in notice step. See
+[the draft Sekko notice contract and Pay API-only integration proposal](docs/sekko-release-notices.md)
+for scope/key prerequisites, public readiness verification, delivery gaps and
+the immutable helper distribution. No caller is activated by this patch.
 
 The host timeout is validated before checkout or CI gating. The follow step timeout
 is `ceil(host-timeout-seconds / 60) + 1` minutes; the deploy job timeout is
@@ -247,7 +255,7 @@ unset until staging prerequisites, trusted host bridge adoption, IAM roles and
 the EIF-specific SSM document are ready. Clearing the variable disables future
 EIF calls; it does not cancel a command already running. Docker callers do not
 depend on this variable. This reusable workflow has only `workflow_call`, adds
-no release trigger, and performs no signing.
+no release trigger, and does not sign deployment artifacts.
 
 The attestation caller must use a staging-only environment map, `ci: required`,
 the approved fleet runner with no hosted fallback, and a reviewed full commit

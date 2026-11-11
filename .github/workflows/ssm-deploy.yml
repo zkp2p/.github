@@ -38,8 +38,19 @@ on:
       runner:
         type: string
         default: ubuntu-latest
+      sekko-release-notice:
+        description: Opt in to bounded Pay API staging notices after a successful image deploy.
+        type: boolean
+        default: false
+      sekko-notice-config:
+        description: Reviewed JSON inbox/scope/target/surface/origin/description; required when opted in.
+        type: string
+        default: ''
     secrets:
       slack-webhook-url:
+        required: false
+      sekko-release-key:
+        description: Dedicated release-ci signing key, at least 32 random bytes encoded as hex.
         required: false
 
 permissions: {}
@@ -503,7 +514,57 @@ jobs:
               exit 0
             }
       - name: Require successful deploy
+        id: require-deploy
         if: always()
         env:
           RESULT: ${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}
         run: test "$RESULT" = success
+      - name: Notify Sekko after successful Pay staging deploy
+        id: sekko-notice
+        if: >-
+          success() && inputs.sekko-release-notice && github.repository == 'zkp2p/pay' &&
+          github.ref_name == 'releases/staging' && inputs.environments-file == 'deploy/environments-pay.yml' &&
+          needs.resolve.outputs.environment == 'staging' && inputs.mode == 'image' &&
+          steps.require-deploy.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: zkp2p/.github/actions/sekko-release-notice@31dc29755140fd21c62836409d56bcc386b92ce3 # final helper must be reachable on main before caller adoption
+        env:
+          SEKKO_NOTICE_ENABLED: ${{ inputs.sekko-release-notice }}
+          SEKKO_NOTICE_CONFIG: ${{ inputs.sekko-notice-config }}
+          SEKKO_RELEASE_KEY: ${{ secrets.sekko-release-key }}
+          NOTICE_REPOSITORY: ${{ github.repository }}
+          NOTICE_REF: ${{ github.ref_name }}
+          NOTICE_ENVIRONMENT: ${{ needs.resolve.outputs.environment }}
+          NOTICE_ENVIRONMENTS_FILE: ${{ inputs.environments-file }}
+          NOTICE_MODE: ${{ inputs.mode }}
+          NOTICE_DEPLOY_RESULT: ${{ steps.require-deploy.outcome }}
+          NOTICE_SOURCE_SHA: ${{ inputs.source-sha }}
+          NOTICE_RUN_ID: ${{ github.run_id }}
+          NOTICE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          NOTICE_COMMAND_ID: ${{ steps.command.outputs.command-id }}
+          NOTICE_DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+      - name: Record Sekko delivery gap
+        if: always() && steps.sekko-notice.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo '::warning::Sekko release notice failed; deployment outcome is separate. Do not redeploy to resend.'
+          printf '%s\n' 'Sekko delivery gap: notice step failed or was interrupted. Deployment outcome is separate. Do not redeploy to resend. Inspect the safe report artifact if available.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve failed Sekko delivery report
+        if: always() && steps.sekko-notice.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sekko-release-notice-gap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sekko-release-notice-report.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Preserve unsigned pending Sekko payload
+        if: always() && steps.sekko-notice.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sekko-release-payload-pending-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sekko-release-notice-pending.json
+          if-no-files-found: ignore
+          retention-days: 7

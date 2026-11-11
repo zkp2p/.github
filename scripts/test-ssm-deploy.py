@@ -70,6 +70,55 @@ class DeployTests(unittest.TestCase):
     def assert_exit(self, result, code):
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
+    def test_sekko_is_optional_and_does_not_change_deploy_permissions(self):
+        call = WORKFLOW["on"]["workflow_call"]
+        opt_in = call["inputs"]["sekko-release-notice"]
+        self.assertEqual(opt_in["type"], "boolean")
+        self.assertIs(opt_in["default"], False)
+        self.assertFalse(opt_in.get("required", False))
+        self.assertEqual(call["inputs"]["sekko-notice-config"]["default"], "")
+        self.assertFalse(call["secrets"]["sekko-release-key"]["required"])
+        deploy = WORKFLOW["jobs"]["deploy"]
+        self.assertEqual(deploy["permissions"], {"id-token": "write", "deployments": "write"})
+        self.assertFalse(any(item.get("uses", "").startswith("actions/checkout@") for item in deploy["steps"]))
+        self.assertEqual(step("deploy", "Require successful deploy")["run"].strip(), 'test "$RESULT" = success')
+        self.assertNotIn("sekko", step("deploy", "Record deployment result")["run"].lower())
+
+    def test_sekko_requires_successful_pay_staging_image_and_exact_map(self):
+        steps = WORKFLOW["jobs"]["deploy"]["steps"]
+        hook = step("deploy", "Notify Sekko after successful Pay staging deploy")
+        self.assertGreater(steps.index(hook), steps.index(step("deploy", "Require successful deploy")))
+        for condition in ("success()", "inputs.sekko-release-notice", "github.repository == 'zkp2p/pay'",
+                          "github.ref_name == 'releases/staging'", "needs.resolve.outputs.environment == 'staging'",
+                          "inputs.environments-file == 'deploy/environments-pay.yml'", "inputs.mode == 'image'",
+                          "steps.require-deploy.outcome == 'success'"):
+            self.assertIn(condition, hook["if"])
+        self.assertTrue(hook["continue-on-error"])
+        self.assertEqual(hook["timeout-minutes"], 2)
+        self.assertRegex(hook["uses"], r"^zkp2p/\.github/actions/sekko-release-notice@[a-f0-9]{40}$")
+        self.assertNotIn("with", hook)  # Signing key is environment-only, never an action argument.
+        self.assertEqual(hook["env"]["SEKKO_RELEASE_KEY"], "${{ secrets.sekko-release-key }}")
+        self.assertEqual(hook["env"]["NOTICE_SOURCE_SHA"], "${{ inputs.source-sha }}")
+        self.assertEqual(hook["env"]["NOTICE_COMMAND_ID"], "${{ steps.command.outputs.command-id }}")
+        self.assertEqual(hook["env"]["NOTICE_DEPLOYMENT_ID"], "${{ steps.deployment.outputs.id }}")
+
+    def test_sekko_delivery_gap_is_separate_and_preserved(self):
+        summary = step("deploy", "Record Sekko delivery gap")
+        artifact = step("deploy", "Preserve failed Sekko delivery report")
+        pending = step("deploy", "Preserve unsigned pending Sekko payload")
+        for item in (summary, artifact, pending):
+            self.assertEqual(item["if"], "always() && steps.sekko-notice.outcome == 'failure'")
+            self.assertTrue(item["continue-on-error"])
+        self.assertIn("Do not redeploy to resend", summary["run"])
+        self.assertEqual(artifact["with"]["path"], "${{ runner.temp }}/sekko-release-notice-report.json")
+        self.assertEqual(artifact["with"]["retention-days"], 7)
+        self.assertRegex(artifact["uses"], r"^actions/upload-artifact@[a-f0-9]{40}$")
+        self.assertEqual(pending["uses"], artifact["uses"])
+        self.assertEqual(pending["with"]["path"], "${{ runner.temp }}/sekko-release-notice-pending.json")
+        self.assertEqual(pending["with"]["if-no-files-found"], "ignore")
+        self.assertEqual(pending["with"]["retention-days"], 7)
+        self.assertNotEqual(pending["with"]["name"], artifact["with"]["name"])
+
     def test_host_timeout_input(self):
         host_timeout = WORKFLOW["on"]["workflow_call"]["inputs"].get("host-timeout-seconds", {})
         self.assertEqual(host_timeout.get("type"), "number")
