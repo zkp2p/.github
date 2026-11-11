@@ -215,6 +215,11 @@ jobs:
               elif length > 0 then "fail"
               else "dispatch"
               end
+          RUNNER_LOSS_JQ: |
+            [.[].jobs[]]
+            | any(.[]; .conclusion == "failure" or .conclusion == "cancelled")
+              and all(.[]; (.steps | type == "array")
+                and all(.steps[]; .conclusion != "failure"))
         run: |
           set -euo pipefail
           started=$(date +%s)
@@ -227,6 +232,29 @@ jobs:
               exit 1
             }
             decision=$(jq -er "$DECISION_JQ" <<< "$runs")
+            if [[ "$decision" == fail ]]; then
+              if failed_run=$(jq -er '
+                .workflow_runs | max_by(.created_at, .id)
+                | select(.id | type == "number")
+                | select(.run_attempt == 1 or .run_attempt == 2)
+                | [.id, .run_attempt, (.updated_at | fromdateiso8601)] | @tsv
+              ' <<< "$runs" 2>/dev/null); then
+                read -r run_id run_attempt updated_at <<< "$failed_run"
+                if (( $(date +%s) < updated_at + 600 )) &&
+                   jobs=$(timeout 60s gh api --paginate --slurp \
+                     "repos/$REPO/actions/runs/$run_id/attempts/$run_attempt/jobs?per_page=100" \
+                     2>/dev/null) &&
+                   jq -e "$RUNNER_LOSS_JQ" <<< "$jobs" >/dev/null 2>&1 &&
+                   (( $(date +%s) < updated_at + 600 )); then
+                  printf 'CI run %s attempt %s: runner-loss grace; waiting up to 10 minutes after %s\n' \
+                    "$run_id" "$run_attempt" "$(jq -r '.workflow_runs | max_by(.created_at, .id) | .updated_at' <<< "$runs")"
+                  decision='wait'
+                fi
+              fi
+            fi
+            if (( $(date +%s) - started >= 2700 )); then
+              break
+            fi
             case "$decision" in
               pass) exit 0 ;;
               fail) echo 'CI failed for the image commit' >&2; exit 1 ;;

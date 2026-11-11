@@ -525,6 +525,113 @@ esac
         self.assertEqual(calls.count(f"api repos/example/repo/actions/workflows/ci.yml/runs?head_sha={'d' * 40}&per_page=20"), 4)
         self.assertEqual(calls.count("workflow run ci.yml --ref releases/staging --repo example/repo"), 1)
 
+    @staticmethod
+    def ci_run(**values):
+        return {"id": 42, "run_attempt": 1, "status": "completed", "conclusion": "failure",
+                "created_at": "1970-01-01T00:10:00Z", "updated_at": "1970-01-01T00:15:00Z",
+                **values}
+
+    def ci_api(self, runs, jobs=None):
+        for index, response in enumerate(runs):
+            (self.root / f"ci-{index}.json").write_text(json.dumps({"workflow_runs": response}))
+        if jobs is not None:
+            (self.root / "ci-jobs.json").write_text(json.dumps(jobs))
+        self.tool("timeout", '[[ "$1" == 60s ]]; shift; exec "$@"')
+        self.tool("gh", '''
+printf '%s\\n' "$*" >> "$STATE/gh-calls"
+if [[ "$*" == "workflow run $CI_WORKFLOW --ref $REF --repo $REPO" ]]; then exit 0; fi
+[[ "$1" == api ]]
+shift
+if [[ "$1" == --paginate ]]; then
+  [[ "$2" == --slurp ]]
+  shift 2
+  [[ "$1" == "repos/$REPO/actions/runs/${CI_RUN_ID:-42}/attempts/${CI_ATTEMPT:-1}/jobs?per_page=100" ]]
+  jq . "$STATE/ci-jobs.json"
+else
+  [[ "$1" == "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" ]]
+  index=$(jq -r . "$STATE/ci-index" 2>/dev/null || echo 0)
+  echo "$((index + 1))" > "$STATE/ci-index"
+  jq . "$STATE/ci-$index.json"
+fi
+''')
+        self.tool("sleep", '[[ "$1" == 30 ]]; echo "$1" >> "$STATE/ci-sleeps"')
+
+    def run_ci(self, **env):
+        gate = step("deploy", "Wait for CI on the image commit")
+        filters = {name: value for name, value in gate["env"].items() if name.endswith("_JQ")}
+        return self.run_step("deploy", gate["name"], CI_WORKFLOW="ci.yml", **filters, **env)
+
+    def test_ci_runner_loss_waits_for_new_attempt(self):
+        self.ci_api([[self.ci_run()],
+                     [self.ci_run(run_attempt=2, status="in_progress", conclusion=None)],
+                     [self.ci_run(run_attempt=2, conclusion="success")]],
+                    jobs=[{"jobs": [{"conclusion": "failure", "steps": [{"conclusion": "cancelled"}]}]}])
+        result = self.run_ci()
+        self.assert_exit(result, 0)
+        self.assertIn("runner-loss grace", result.stdout)
+        self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30", "30"])
+        self.assertEqual((self.root / "gh-calls").read_text().count("/attempts/1/jobs"), 1)
+
+    def test_ci_runner_loss_fails_at_grace_deadline(self):
+        self.ci_api([[self.ci_run()]], jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+        result = self.run_ci(NOW="1500")
+        self.assert_exit(result, 1)
+        self.assertIn("CI failed for the image commit", result.stderr)
+        self.assertFalse((self.root / "ci-sleeps").exists())
+
+    def test_ci_runner_loss_grace_expires_while_waiting(self):
+        self.ci_api([[self.ci_run()], [self.ci_run()]],
+                    jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+        self.tool("date", 'if [[ -f "$STATE/ci-sleeps" ]]; then echo 1500; else echo 1000; fi')
+        result = self.run_ci()
+        self.assert_exit(result, 1)
+        self.assertIn("CI failed for the image commit", result.stderr)
+        self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"])
+
+    def test_ci_failed_step_anywhere_fails_immediately(self):
+        for conclusion in ("failure", "cancelled", "success"):
+            with self.subTest(conclusion=conclusion):
+                (self.root / "ci-index").unlink(missing_ok=True)
+                self.ci_api([[self.ci_run()]], jobs=[
+                    {"jobs": [{"conclusion": "failure", "steps": []}]},
+                    {"jobs": [{"conclusion": conclusion, "steps": [{"conclusion": "failure"}]}]},
+                ])
+                result = self.run_ci()
+                self.assert_exit(result, 1)
+                self.assertIn("CI failed for the image commit", result.stderr)
+                self.assertFalse((self.root / "ci-sleeps").exists())
+
+    def test_ci_third_attempt_fails_without_grace(self):
+        self.ci_api([[self.ci_run(run_attempt=3)]])
+        result = self.run_ci()
+        self.assert_exit(result, 1)
+        self.assertIn("CI failed for the image commit", result.stderr)
+        self.assertNotIn("/jobs", (self.root / "gh-calls").read_text())
+        self.assertFalse((self.root / "ci-sleeps").exists())
+
+    def test_ci_grace_uses_newest_run_and_latest_attempt(self):
+        newer = self.ci_run(id=43, run_attempt=2, created_at="1970-01-01T00:11:00Z")
+        self.ci_api([[newer, self.ci_run()], [self.ci_run(conclusion="success")]],
+                    jobs=[{"jobs": [{"conclusion": "cancelled", "steps": []}]}])
+        result = self.run_ci(CI_RUN_ID="43", CI_ATTEMPT="2")
+        self.assert_exit(result, 0)
+        self.assertIn("/runs/43/attempts/2/jobs", (self.root / "gh-calls").read_text())
+
+    def test_ci_jobs_api_error_fails_closed(self):
+        self.ci_api([[self.ci_run()]])
+        result = self.run_ci()
+        self.assert_exit(result, 1)
+        self.assertIn("CI failed for the image commit", result.stderr)
+        self.assertFalse((self.root / "ci-sleeps").exists())
+
+    def test_ci_runner_loss_does_not_extend_overall_deadline(self):
+        self.ci_api([[self.ci_run()]], jobs=[{"jobs": [{"conclusion": "failure", "steps": []}]}])
+        self.tool("date", 'if [[ -f "$STATE/ci-sleeps" ]]; then echo 3700; else echo 1000; fi')
+        result = self.run_ci()
+        self.assert_exit(result, 1)
+        self.assertIn("CI did not pass within 45 minutes", result.stderr)
+        self.assertEqual((self.root / "ci-sleeps").read_text().splitlines(), ["30"])
+
     def test_send_command_preserves_parameters_and_delivery_timeout(self):
         self.tool("aws", '''
 [[ "$1 $2" == 'ssm send-command' ]]

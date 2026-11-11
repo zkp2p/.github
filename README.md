@@ -300,11 +300,19 @@ by the attestation/peer-infra caller integration.
 
 ### CI and command following
 
-For image deploys with `ci: required`, the workflow polls CI for the image commit
-every 30 seconds for up to 45 minutes. A completed success passes; otherwise any
+For image and parent deploys with `ci: required`, the workflow polls CI for the
+source commit every 30 seconds for up to 45 minutes. A completed success passes; otherwise any
 unfinished run keeps it waiting, completed unsuccessful runs fail, and no runs
 triggers one dispatch followed by polling. Config modes and `ci: skip` bypass
 this gate.
+
+When only completed unsuccessful runs exist, the newest run gets a runner-loss
+grace period if its latest attempt has failed or cancelled jobs but no failed
+step anywhere. Attempts 1 and 2 wait until 10 minutes after the run's `updated_at`
+to let the spot re-run automation start a new attempt; a running attempt then
+uses the normal wait path. A failed step, attempt 3, an expired grace period or
+unreadable job evidence fails immediately. The grace does not extend the overall
+45-minute cap. Each API call remains bounded to 60 seconds.
 
 The deploy role must support a 7,200-second OIDC session and permit sending only
 the intended document to its target instance, plus reading its CloudWatch log
@@ -334,20 +342,23 @@ Run the local checks from the repository root (Docker must be running; the shell
 step harnesses also require Python 3, jq, OpenSSL and `sha256sum`):
 
 ```bash
-bash scripts/test-ci-gate.sh # 4 passed
+bash scripts/test-ci-gate.sh
 python3 scripts/test-ssm-deploy.py
 python3 scripts/test-build-deploy-image-public.py
 actionlint .github/workflows/*.yml
 ```
 
-The test extracts the workflow's `decide.env.DECISION_JQ` with
+The test extracts the workflow's CI decision and runner-loss jq filters with
 `mikefarah/yq:4.44.3` and checks success, failure with an unfinished run, failure
-only, and empty results. The shell step harness checks host timeout validation and
-rounding, yq selection, log pagination and deduplication, polling failures/timeouts,
+only, empty results and failed-step evidence across job pages. The shell step
+harness checks host timeout validation and rounding, yq selection, log pagination
+and deduplication, polling failures/timeouts,
 Slack failures, and the final success gate with isolated fake external commands.
 It also checks Docker/EIF identity validation, dormant EIF gating, unchanged SSM
 parameters and config normalization, run/attempt forwarding, delivery timeout,
 and exact-SHA CI polling with a single dispatch through a fake `gh` command.
+Runner-loss checks cover grace expiry, real failed steps, the latest attempt,
+the re-run limit, API errors and the overall CI deadline.
 These checks do not exercise a live deployment or call AWS/GitHub APIs.
 
 The public build harness checks the event guard, fixed hosted runner, caller
