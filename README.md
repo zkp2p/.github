@@ -121,6 +121,12 @@ and follows its CloudWatch logs. Pin the reusable workflow to a reviewed commit.
 All deployment infrastructure identifiers come from the caller's environment
 map; the SSM workflow contains no deployment credentials or account configuration.
 
+A single `deploy` job validates inputs, checks out and resolves the environment
+map, waits for required CI, then deploys. It uses `inputs.runner` throughout,
+so ephemeral runners are acquired only once. Callers' failed-job names are now
+`<caller job> / deploy`, including validation and CI failures. The peer-infra
+config-cd reconciler is being updated separately to recognize this job name.
+
 The caller's `deploy/environments.yml` uses this schema (replace placeholders
 in the caller repository):
 
@@ -200,15 +206,17 @@ the final success gate depends only on log polling and deployment-status recordi
 | `runner` | Default `ubuntu-latest`; a Linux runner with Bash, jq, gh, AWS CLI, OpenSSL, GNU timeout and mikefarah/yq v4 (or Docker when yq is absent). |
 
 The host timeout is validated before checkout or CI gating. The follow step timeout
-is `ceil(host-timeout-seconds / 60) + 1` minutes; the deploy job timeout is
-`ceil(host-timeout-seconds / 60) + 15` minutes. The default preserves the existing
-66-minute step and 80-minute job limits. For example, `host-timeout-seconds: 5700`
-follows for 95 minutes, with a 96-minute step and a 110-minute job.
+is `ceil(host-timeout-seconds / 60) + 1` minutes (66 minutes by default, or
+96 minutes for `host-timeout-seconds: 5700`). The single job has a static
+190-minute bound, covering environment resolution, the CI gate and the maximum
+110-minute host follow plus the existing margins. The CI wait has its own
+50-minute step timeout and retains its 45-minute polling cap.
 
-The maximum is 6600 seconds because the deploy job's AWS credentials last 7200
-seconds, also the module role's maximum session duration. This leaves 600 seconds
-of headroom for delivery and the steps before log following; longer follows could
-outlast the credentials and lose CloudWatch access.
+The maximum is 6600 seconds because the deploy role's AWS credentials last 7200
+seconds, also the module role's maximum session duration. The role is assumed
+only after CI passes or is skipped. This leaves 600 seconds of headroom for
+delivery and the steps before log following; longer follows could outlast the
+credentials and lose CloudWatch access.
 
 Environment resolution uses the runner's preinstalled mikefarah/yq, verified by
 `yq --version`, and falls back to `mikefarah/yq:4.44.3` in Docker only when yq is

@@ -77,24 +77,24 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(host_timeout.get("required", False))
 
     def test_host_timeout_minutes(self):
-        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
+        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["deploy"]["steps"]])
         for seconds, follow, deploy in ((600, 11, 25), (601, 12, 26), (2400, 41, 55), (3899, 66, 80),
                                         (3900, 66, 80), (3901, 67, 81), (5700, 96, 110),
                                         (6599, 111, 125), (6600, 111, 125)):
             with self.subTest(seconds=seconds):
-                result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=str(seconds))
+                result = self.run_step("deploy", "Validate host timeout", HOST_TIMEOUT_SECONDS=str(seconds))
                 self.assert_exit(result, 0)
                 outputs = dict(line.split("=", 1) for line in (self.root / "outputs").read_text().splitlines())
                 self.assertEqual(outputs["follow-timeout-minutes"], str(follow))
                 self.assertEqual(outputs["deploy-timeout-minutes"], str(deploy))
 
     def test_invalid_host_timeout_fails_before_outputs(self):
-        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["resolve"]["steps"]])
+        self.assertIn("Validate host timeout", [item["name"] for item in WORKFLOW["jobs"]["deploy"]["steps"]])
         for value in ("", "0", "-1", "599", "6601", "7200", "14400", "14401", "600.5", "3900.1",
                       "1e20", "18446744073709552216", "abc", "600\nother=value"):
             with self.subTest(value=value):
                 (self.root / "outputs").unlink(missing_ok=True)
-                result = self.run_step("resolve", "Validate host timeout", HOST_TIMEOUT_SECONDS=value)
+                result = self.run_step("deploy", "Validate host timeout", HOST_TIMEOUT_SECONDS=value)
                 self.assert_exit(result, 1)
                 self.assertIn("host-timeout-seconds must be an integer between 600 and 6600", result.stderr)
                 self.assertFalse((self.root / "outputs").exists())
@@ -111,7 +111,7 @@ class DeployTests(unittest.TestCase):
 
     def assert_resolved_values(self, region="test-region", document="test-document", log_group="test-logs"):
         self.config_tool("docker")
-        self.assert_exit(self.run_step("resolve", "Resolve environment"), 0)
+        self.assert_exit(self.run_step("deploy", "Resolve environment"), 0)
         outputs = dict(line.split("=", 1) for line in (self.root / "outputs").read_text().splitlines())
         self.assertEqual(outputs, {
             "environment": "staging", "instance-id": "i-test", "role-arn": "test-role",
@@ -142,7 +142,7 @@ class DeployTests(unittest.TestCase):
             with self.subTest(key=key):
                 config = {name: value for name, value in self.config.items() if name != key}
                 self.config_tool("docker", config)
-                result = self.run_step("resolve", "Resolve environment")
+                result = self.run_step("deploy", "Resolve environment")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Invalid environment configuration", result.stderr)
                 self.assertFalse((self.root / "outputs").exists())
@@ -156,7 +156,7 @@ class DeployTests(unittest.TestCase):
                         target = config if level == "top" else config["environments"]["staging"]
                         target[key] = value
                         self.config_tool("docker", config)
-                        result = self.run_step("resolve", "Resolve environment")
+                        result = self.run_step("deploy", "Resolve environment")
                         self.assertNotEqual(result.returncode, 0)
                         self.assertFalse((self.root / "outputs").exists())
 
@@ -164,23 +164,23 @@ class DeployTests(unittest.TestCase):
         self.config_tool("yq")
         for version in ("yq (https://github.com/mikefarah/yq/) version v4.44.3", "yq version v4.44.3"):
             with self.subTest(version=version):
-                result = self.run_step("resolve", "Resolve environment", YQ_VERSION=version)
+                result = self.run_step("deploy", "Resolve environment", YQ_VERSION=version)
                 self.assert_exit(result, 0)
                 self.assertIn("environment=staging", (self.root / "outputs").read_text())
 
     def test_missing_yq_uses_pinned_docker(self):
         self.config_tool("docker")
-        self.assert_exit(self.run_step("resolve", "Resolve environment"), 0)
+        self.assert_exit(self.run_step("deploy", "Resolve environment"), 0)
 
     def test_incompatible_yq_fails_without_docker(self):
         self.config_tool("yq")
         self.config_tool("docker")
-        self.assert_exit(self.run_step("resolve", "Resolve environment", YQ_VERSION="yq 3.4.3"), 1)
+        self.assert_exit(self.run_step("deploy", "Resolve environment", YQ_VERSION="yq 3.4.3"), 1)
 
     def test_native_yq_read_failure_does_not_fall_back(self):
         self.tool("yq", 'if [[ "$1" == --version ]]; then echo "yq version v4.44.3"; else exit 1; fi')
         self.config_tool("docker")
-        result = self.run_step("resolve", "Resolve environment")
+        result = self.run_step("deploy", "Resolve environment")
         self.assert_exit(result, 1)
         self.assertIn("Could not read environments-file", result.stderr)
 
@@ -214,7 +214,7 @@ class DeployTests(unittest.TestCase):
                                                       "Mode", "RunAttempt", "RunId", "SourceSha"])
 
     def normalize_parameters(self, **env):
-        result = self.run_step("resolve", "Validate artifact identity", **env)
+        result = self.run_step("deploy", "Validate artifact identity", **env)
         if result.returncode != 0:
             return result
         return self.run_step("deploy", "Normalize deploy parameters", **env)
@@ -227,7 +227,7 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(artifact_kind.get("required", False))
 
     def test_artifact_validation_precedes_external_actions(self):
-        resolve = WORKFLOW["jobs"]["resolve"]
+        resolve = WORKFLOW["jobs"]["deploy"]
         self.assertEqual(resolve["steps"][0]["name"], "Validate artifact identity")
         validation = resolve["steps"][0]
         self.assertNotIn("if", validation)
@@ -237,15 +237,42 @@ class DeployTests(unittest.TestCase):
             "IMAGE_ID": "${{ inputs.image-id }}", "ALLOW_KEY_REMOVAL": "${{ inputs.allow-key-removal }}",
             "EIF_ENABLED": "${{ vars.SSM_DEPLOY_EIF_ENABLED }}",
         })
-        gate = WORKFLOW["jobs"]["ci-gate"]
-        self.assertEqual(gate["needs"], "resolve")
-        self.assertEqual(gate["if"], "needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
+        gate = step("deploy", "Wait for CI on the image commit")
+        self.assertEqual(gate["if"], "steps.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
+        self.assertEqual(gate["env"]["SHA"], "${{ inputs.source-sha }}")
+
+    def test_single_job_order_permissions_and_timeouts(self):
+        self.assertEqual(set(WORKFLOW["jobs"]), {"deploy"})
         deploy = WORKFLOW["jobs"]["deploy"]
-        self.assertEqual(deploy["needs"], ["resolve", "ci-gate"])
-        self.assertIn("needs.resolve.result == 'success'", deploy["if"])
-        self.assertIn("needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped'", deploy["if"])
-        self.assertEqual(step("ci-gate", "Wait for CI on the image commit")["env"]["SHA"],
-                         "${{ inputs.source-sha }}")
+        self.assertNotIn("needs", deploy)
+        self.assertNotIn("if", deploy)
+        self.assertEqual(deploy["runs-on"], "${{ inputs.runner }}")
+        self.assertEqual(deploy["permissions"], {
+            "contents": "read", "actions": "write", "id-token": "write", "deployments": "write",
+        })
+        self.assertEqual(deploy["timeout-minutes"], 190)
+        self.assertEqual(step("deploy", "Wait for CI on the image commit")["timeout-minutes"], 50)
+        self.assertEqual(step("deploy", "Follow command logs")["timeout-minutes"],
+                         "${{ fromJSON(steps.timeouts.outputs.follow-timeout-minutes) }}")
+        names = [item["name"] for item in deploy["steps"]]
+        self.assertEqual(names[:7], [
+            "Validate artifact identity", "Patch hosted action runtime", "Validate host timeout",
+            "Check out caller environment map", "Resolve environment",
+            "Wait for CI on the image commit", "Normalize deploy parameters",
+        ])
+        self.assertEqual(names.count("Patch hosted action runtime"), 1)
+        self.assertLess(names.index("Wait for CI on the image commit"), names.index("Assume deploy role"))
+        role = step("deploy", "Assume deploy role")
+        self.assertEqual(role["with"]["role-duration-seconds"], 7200)
+        self.assertNotIn("if", role)
+        checkout = step("deploy", "Check out caller environment map")["with"]
+        self.assertEqual(checkout["ref"], "${{ github.sha }}")
+        self.assertEqual(checkout["sparse-checkout"], "${{ inputs.environments-file }}")
+        self.assertFalse(checkout["sparse-checkout-cone-mode"])
+        self.assertFalse(checkout["persist-credentials"])
+        for item in deploy["steps"]:
+            if "uses" in item:
+                self.assertRegex(item["uses"], r"@[a-f0-9]{40}$")
 
     def test_docker_and_eif_parameter_contract(self):
         for kind, identity, artifact in (
@@ -289,7 +316,7 @@ class DeployTests(unittest.TestCase):
         return self.normalize_parameters(**{**values, **env})
 
     def test_parent_mode_accepts_eif_parent_id(self):
-        self.assert_exit(self.run_step("resolve", "Validate artifact identity", MODE="parent",
+        self.assert_exit(self.run_step("deploy", "Validate artifact identity", MODE="parent",
                                        ARTIFACT_KIND="eif", IMAGE_ID="parent:" + "0123456789abcdef" * 4,
                                        EIF_ENABLED="true"), 0)
 
@@ -310,21 +337,21 @@ class DeployTests(unittest.TestCase):
                 self.assertFalse((self.root / "ssm-parameters.json").exists())
 
     def test_parent_mode_runs_ci_gate(self):
-        self.assertEqual(WORKFLOW["jobs"]["ci-gate"]["if"],
-                         "needs.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
+        self.assertEqual(step("deploy", "Wait for CI on the image commit")["if"],
+                         "steps.resolve.outputs.ci == 'required' && (inputs.mode == 'image' || inputs.mode == 'parent')")
         self.tool("gh", '''
 [[ "$1" == api ]]
 [[ "$2" == "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$SHA&per_page=20" ]]
 echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}'
 ''')
-        gate = step("ci-gate", "Wait for CI on the image commit")
-        self.assert_exit(self.run_step("ci-gate", "Wait for CI on the image commit", MODE="parent",
+        gate = step("deploy", "Wait for CI on the image commit")
+        self.assert_exit(self.run_step("deploy", "Wait for CI on the image commit", MODE="parent",
                                        SHA="d" * 40, CI_WORKFLOW="ci.yml",
                                        DECISION_JQ=gate["env"]["DECISION_JQ"]), 0)
 
     def test_parent_mode_normalized_ssm_parameters(self):
-        self.assertEqual(WORKFLOW["jobs"]["deploy"]["env"]["DEPLOY_ENVIRONMENT"],
-                         "${{ needs.resolve.outputs.environment }}")
+        self.assertEqual(step("deploy", "Normalize deploy parameters")["env"]["DEPLOY_ENVIRONMENT"],
+                         "${{ steps.resolve.outputs.environment }}")
         for environment, prefix in (("staging", ""), ("prod", "prod/")):
             with self.subTest(environment=environment):
                 key = f"zkp2p/attestation-service/{prefix}parent/{'b' * 64}/parent-bundle.tar.gz"
@@ -458,7 +485,7 @@ echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}'
                 self.assertIn("SSM_DEPLOY_EIF_ENABLED=true", result.stderr)
                 self.assertFalse((self.root / "ssm-parameters.json").exists())
                 # Existing image callers do not depend on the opt-in variable.
-                self.assert_exit(self.run_step("resolve", "Validate artifact identity", EIF_ENABLED=value), 0)
+                self.assert_exit(self.run_step("deploy", "Validate artifact identity", EIF_ENABLED=value), 0)
 
     def test_source_and_manifest_validation_remain_strict(self):
         for kind, identity in (("docker", "sha256:" + "a" * 64), ("eif", "pcr0:" + "a" * 96)):
@@ -490,8 +517,8 @@ case "$1" in
 esac
 ''')
         self.tool("sleep", '[[ "$1" == 30 ]]')
-        gate = step("ci-gate", "Wait for CI on the image commit")
-        result = self.run_step("ci-gate", "Wait for CI on the image commit",
+        gate = step("deploy", "Wait for CI on the image commit")
+        result = self.run_step("deploy", "Wait for CI on the image commit",
                                SHA="d" * 40, CI_WORKFLOW="ci.yml", DECISION_JQ=gate["env"]["DECISION_JQ"])
         self.assert_exit(result, 0)
         calls = (self.root / "gh-calls").read_text().splitlines()
@@ -566,7 +593,8 @@ esac
 
     def test_final_gate_and_slack_result_by_mode(self):
         gate = step("deploy", "Require successful deploy")
-        self.assertEqual(gate["if"], "always()")
+        self.assertEqual(gate["if"], "always() && steps.normalize.outcome != 'skipped'")
+        self.assertEqual(step("deploy", "Notify Slack if configured")["if"], gate["if"])
         self.assertEqual(gate["env"]["RESULT"],
                          "${{ steps.poll.outcome == 'success' && (inputs.mode == 'config-plan' || steps.status.outcome == 'success') && 'success' || 'failure' }}")
         self.assertEqual(step("deploy", "Notify Slack if configured")["env"]["RESULT"],

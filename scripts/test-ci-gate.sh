@@ -7,7 +7,7 @@ if [[ ! -f .github/workflows/ssm-deploy.yml ]]; then
 fi
 
 decision_jq=$(docker run --rm -v "$PWD:/w" -w /w mikefarah/yq:4.44.3 \
-  '.jobs.ci-gate.steps[] | select(.id == "decide") | .env.DECISION_JQ' \
+  '.jobs.deploy.steps[] | select(.id == "decide") | .env.DECISION_JQ' \
   .github/workflows/ssm-deploy.yml)
 if [[ -z "$decision_jq" || "$decision_jq" == null ]]; then
   echo 'FAIL: decide.env.DECISION_JQ is missing' >&2
