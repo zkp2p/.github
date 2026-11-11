@@ -125,7 +125,14 @@ A single `deploy` job validates inputs, checks out and resolves the environment
 map, waits for required CI, then deploys. It uses `inputs.runner` throughout,
 so ephemeral runners are acquired only once. Callers' failed-job names are now
 `<caller job> / deploy`, including validation and CI failures. The peer-infra
-config-cd reconciler is being updated separately to recognize this job name.
+config-CD reconciler recognizes both this job name and the older
+`<caller job> / ci-gate` shape (peer-infra #158); see peer-infra
+`stacks/config-cd/RUNBOOK.md`.
+
+This workflow has no rollback mode. Rollback is owned by each caller's deploy
+doc, normally by moving the release branch to a known-good commit so the same
+CI gate and deploy run again; host-side recovery belongs to the caller's host
+tool (peer-infra `tools/peer-deploy` or the repository's own bridge).
 
 The caller's `deploy/environments.yml` uses this schema (replace placeholders
 in the caller repository):
