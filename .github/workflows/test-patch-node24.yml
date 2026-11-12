@@ -5,6 +5,7 @@ on:
     paths:
       - actions/patch-node24/**
       - scripts/test-patch-native-brotli.py
+      - scripts/test-patch-node24.cjs
       - .github/workflows/test-patch-node24.yml
       - README.md
   push:
@@ -12,6 +13,7 @@ on:
     paths:
       - actions/patch-node24/**
       - scripts/test-patch-native-brotli.py
+      - scripts/test-patch-node24.cjs
       - .github/workflows/test-patch-node24.yml
       - README.md
 
@@ -34,5 +36,7 @@ jobs:
           persist-credentials: false
       - name: Test native Brotli release gates
         run: python3 scripts/test-patch-native-brotli.py
+      - name: Test Node security version gate
+        run: node --test scripts/test-patch-node24.cjs
       - name: Patch hosted runtimes
         uses: ./actions/patch-node24

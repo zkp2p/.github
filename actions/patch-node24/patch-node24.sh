@@ -12,8 +12,8 @@ unset NODE_OPTIONS
   exit 1
 }
 case "$(uname -m)" in
-  x86_64) arch=x64; checksum=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6 ;;
-  aarch64) arch=arm64; checksum=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e ;;
+  x86_64) arch=x64; checksum=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb ;;
+  aarch64) arch=arm64; checksum=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c ;;
   *) echo '::error::Only Linux x64 and arm64 action runtimes are supported'; exit 1 ;;
 esac
 
@@ -49,7 +49,8 @@ else:
 PY
 )
 
-fixed=$("$node" -p 'require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH === -17')
+security_check="$(dirname "${BASH_SOURCE[0]}")/check-node24.cjs"
+fixed=$("$node" "$security_check")
 if [[ $fixed == false ]]; then
   work=$(mktemp -d "$RUNNER_TEMP/node24-security.XXXXXX")
   candidate=''
@@ -58,14 +59,14 @@ if [[ $fixed == false ]]; then
     if [[ -n $candidate ]]; then sudo -n rm -f -- "$candidate"; fi
   }
   trap cleanup EXIT
-  archive="node-v24.22.1-linux-$arch.tar.xz"
+  archive="node-v24.22.3-linux-$arch.tar.xz"
   curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --connect-timeout 15 --max-time 180 "https://nodejs.org/dist/v24.22.1/$archive" \
+    --connect-timeout 15 --max-time 180 "https://nodejs.org/dist/v24.22.3/$archive" \
     --output "$work/$archive"
   printf '%s  %s\n' "$checksum" "$work/$archive" | sha256sum --check
-  tar -xJf "$work/$archive" -C "$work" --strip-components=2 "node-v24.22.1-linux-$arch/bin/node"
-  [[ $("$work/node" -p process.version) == v24.22.1 ]]
-  "$work/node" -e 'if(require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH !== -17) process.exit(1)'
+  tar -xJf "$work/$archive" -C "$work" --strip-components=2 "node-v24.22.3-linux-$arch/bin/node"
+  [[ $("$work/node" -p process.version) == v24.22.3 ]]
+  [[ $("$work/node" "$security_check") == true ]]
   candidate=$(sudo -n mktemp "$(dirname "$node")/.node-security.XXXXXX")
   sudo -n install -m 0755 "$work/node" "$candidate"
   sudo -n chown --reference="$node" "$candidate"
@@ -75,6 +76,6 @@ if [[ $fixed == false ]]; then
 else
   [[ $fixed == true ]]
 fi
-"$node" -e 'if(require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH !== -17) process.exit(1)'
+[[ $("$node" "$security_check") == true ]]
 "$node" -p 'JSON.stringify({execPath:process.execPath,node:process.versions.node,brotli:process.versions.brotli,blockSwitch:require("node:zlib").constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH})'
 printf '%s\n' FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true >> "$GITHUB_ENV"
