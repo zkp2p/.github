@@ -21,7 +21,7 @@ steps:
 ```
 
 The composite uses shell steps without JavaScript. It derives the binary path from the
-running Worker, downloads checksum-pinned official Node 24.22.1, and atomically
+running Worker, downloads checksum-pinned official Node 24.22.3, and atomically
 replaces that bundled binary using the hosted runner's existing sudo
 access. An already-fixed decoder is retained. It selects Node 24 for subsequent
 legacy JavaScript actions through GitHub's supported migration setting.
@@ -58,7 +58,7 @@ The `Test patch-node24` workflow runs the local action on GitHub-hosted
 locally with `python3 scripts/test-patch-native-brotli.py`.
 
 Sources: [Node security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
-and [official archive checksums](https://nodejs.org/dist/v24.22.1/SHASUMS256.txt).
+and [official archive checksums](https://nodejs.org/dist/v24.22.3/SHASUMS256.txt).
 
 ## Public repository image builds
 
