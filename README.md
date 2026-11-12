@@ -9,7 +9,7 @@ Learn more at [peer.xyz](https://peer.xyz) and [docs.peer.xyz](https://docs.peer
 ## Hosted action runtime security
 
 `actions/patch-node24` patches the actual GitHub-hosted runner's bundled Node 24
-for CVE-2026-111497 before main JavaScript steps execute. Put it first in each
+for CVE-2026-111497 and the November 2026 Node security fixes before main JavaScript steps execute. Put it first in each
 Linux host job, before checkout, and pin the reviewed commit. First confirm that
 none of the job's actions declares a JavaScript `pre` hook: the runner starts
 those hooks before ordinary steps, so this bootstrap cannot protect them.
@@ -23,7 +23,8 @@ steps:
 The composite uses shell steps without JavaScript. It derives the binary path from the
 running Worker, downloads checksum-pinned official Node 24.22.3, and atomically
 replaces that bundled binary using the hosted runner's existing sudo
-access. An already-fixed decoder is retained. It selects Node 24 for subsequent
+access. An existing binary is retained only when it runs stable Node 24.22.3 or
+later in the 24.x line and passes the Brotli decoder check. It selects Node 24 for subsequent
 legacy JavaScript actions through GitHub's supported migration setting.
 
 Runtime symlinks are resolved before inspection or replacement. The target must
