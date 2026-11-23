@@ -20,7 +20,7 @@ The result: direct fiat-to-crypto trades with real payment verification instead 
 |---|---|
 | [zkp2p-contracts](https://github.com/zkp2p/zkp2p-contracts) | Core protocol smart contracts on Base |
 | [zkp2p-client-sdk](https://github.com/zkp2p/zkp2p-client-sdk) | Browser-first TypeScript SDK for building on the protocol |
-| [peer-cash](https://github.com/zkp2p/peer-cash) | Peer Cash SDK: cash out Base USDC to fiat, built agent-first |
+| [@zkp2p/sdk](https://www.npmjs.com/package/@zkp2p/sdk) | Peer SDK: sell Base USDC for fiat with `createPeer()` and `peer.sell()`, plus the protocol client |
 | [peer-examples](https://github.com/zkp2p/peer-examples) | Open-source integration examples and templates |
 | [zkp2p-skills](https://github.com/zkp2p/zkp2p-skills) | Agent Skills for AI agents to use the protocol on Base |
 | [zkp2p-v1-monorepo](https://github.com/zkp2p/zkp2p-v1-monorepo) | The original ZKP2P V1, preserved for history |
